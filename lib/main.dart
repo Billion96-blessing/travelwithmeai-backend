@@ -4,6 +4,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'api_config.dart';
 import 'auth_service.dart';
 import 'realtime_bridge.dart';
 
@@ -112,6 +113,9 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
   bool micMuted = false;
   bool goalRecording = false;
   bool goalProcessing = false;
+  bool backendConnected = false;
+  bool microphonePermission = false;
+  bool realtimeReady = false;
   String statusMessage = 'Ready to start realtime negotiation.';
   final realtimeBridge = RealtimeBridge();
   final authService = createAuthService();
@@ -236,8 +240,11 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
       voiceState = VoiceState.thinking;
       selectedTab = 1;
       micMuted = false;
+      backendConnected = false;
+      microphonePermission = false;
+      realtimeReady = false;
       approvalRequired = true;
-      statusMessage = 'Connecting to realtime AI voice...';
+      statusMessage = 'Connecting to ${ApiConfig.backendBaseUrl}...';
       liveAiTranscript = '';
       providerMessages
         ..clear()
@@ -350,9 +357,22 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
               data['message']?.toString() ?? 'Realtime status update';
           statusMessage = message;
           voiceState = voiceStateFromStatus(message);
+          updateConnectionFlagsFromStatus(message);
+        case 'backend_status':
+          backendConnected = data['connected'] == true;
+          microphonePermission = data['microphonePermission'] == true;
+          realtimeReady = data['realtimeReady'] == true;
+          statusMessage = backendConnected
+              ? realtimeReady
+                  ? 'Cloud backend connected. Realtime ready.'
+                  : 'Cloud backend connected. Add OPENAI_API_KEY on Render.'
+              : 'Cloud backend disconnected.';
         case 'provider_transcript':
           final text = data['text']?.toString().trim();
           if (text != null && text.isNotEmpty) {
+            backendConnected = true;
+            microphonePermission = true;
+            realtimeReady = true;
             providerMessages.add(
               ConversationLine(
                 title: 'Provider original',
@@ -470,21 +490,46 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
               data['message']?.toString() ?? 'Realtime voice error.';
           statusMessage = message;
           voiceState = VoiceState.ready;
+          backendConnected = false;
+          realtimeReady = false;
           aiMessages.add(
             ConversationLine(
               title: 'Connection issue',
               text: message,
               translation:
-                  'Check that the Node backend is running on port 3000 and your API key is set.',
+                  'Check Render deployment, then set OPENAI_API_KEY only in the backend environment.',
             ),
           );
       }
     });
   }
 
+  void updateConnectionFlagsFromStatus(String message) {
+    final normalized = message.toLowerCase();
+    if (normalized.contains('disconnect') || normalized.contains('stopped')) {
+      backendConnected = false;
+      realtimeReady = false;
+      return;
+    }
+    if (normalized.contains('connected') ||
+        normalized.contains('listening') ||
+        normalized.contains('ai')) {
+      backendConnected = true;
+      realtimeReady = true;
+    }
+    if (normalized.contains('permission') ||
+        normalized.contains('microphone') ||
+        normalized.contains('listening')) {
+      microphonePermission = !normalized.contains('requesting');
+    }
+  }
+
   VoiceState voiceStateFromStatus(String message) {
     final normalized = message.toLowerCase();
     if (normalized.contains('muted')) return VoiceState.paused;
+    if (normalized.contains('stop') || normalized.contains('disconnect')) {
+      return VoiceState.ready;
+    }
     if (normalized.contains('waiting')) return VoiceState.ready;
     if (normalized.contains('listening')) return VoiceState.listening;
     if (normalized.contains('ai') || normalized.contains('confirm')) {
@@ -492,9 +537,6 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
     }
     if (normalized.contains('permission') || normalized.contains('connect')) {
       return VoiceState.thinking;
-    }
-    if (normalized.contains('stop') || normalized.contains('disconnect')) {
-      return VoiceState.ready;
     }
     return voiceState;
   }
@@ -587,6 +629,10 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
         return _LiveConversationSection(
           state: voiceState,
           micMuted: micMuted,
+          backendConnected: backendConnected,
+          microphonePermission: microphonePermission,
+          realtimeReady: realtimeReady,
+          backendBaseUrl: ApiConfig.backendBaseUrl,
           providerMessages: providerMessages,
           aiMessages: aiMessages,
           onMic: startNegotiation,
@@ -1448,6 +1494,10 @@ class _LiveConversationSection extends StatelessWidget {
   const _LiveConversationSection({
     required this.state,
     required this.micMuted,
+    required this.backendConnected,
+    required this.microphonePermission,
+    required this.realtimeReady,
+    required this.backendBaseUrl,
     required this.providerMessages,
     required this.aiMessages,
     required this.onMic,
@@ -1459,6 +1509,10 @@ class _LiveConversationSection extends StatelessWidget {
 
   final VoiceState state;
   final bool micMuted;
+  final bool backendConnected;
+  final bool microphonePermission;
+  final bool realtimeReady;
+  final String backendBaseUrl;
   final List<ConversationLine> providerMessages;
   final List<ConversationLine> aiMessages;
   final VoidCallback onMic;
@@ -1555,6 +1609,13 @@ class _LiveConversationSection extends StatelessWidget {
                 ),
                 const SizedBox(height: 18),
                 const _LiveBudgetCard(),
+                const SizedBox(height: 12),
+                _BackendStatusStrip(
+                  connected: backendConnected,
+                  microphonePermission: microphonePermission,
+                  realtimeReady: realtimeReady,
+                  backendBaseUrl: backendBaseUrl,
+                ),
                 const SizedBox(height: 16),
                 _ReferenceChatBubble(line: providerLine, isAi: false),
                 const SizedBox(height: 14),
@@ -1642,6 +1703,118 @@ class _LiveStatusPill extends StatelessWidget {
               color: Colors.white,
               fontWeight: FontWeight.w900,
               fontSize: 14,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BackendStatusStrip extends StatelessWidget {
+  const _BackendStatusStrip({
+    required this.connected,
+    required this.microphonePermission,
+    required this.realtimeReady,
+    required this.backendBaseUrl,
+  });
+
+  final bool connected;
+  final bool microphonePermission;
+  final bool realtimeReady;
+  final String backendBaseUrl;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.86),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white, width: 1.4),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x08000000),
+            blurRadius: 16,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _TinyStatusChip(
+                label: connected ? 'Connected' : 'Disconnected',
+                active: connected,
+                icon: connected ? Icons.cloud_done : Icons.cloud_off,
+              ),
+              _TinyStatusChip(
+                label: microphonePermission
+                    ? 'Mic permission'
+                    : 'Mic permission needed',
+                active: microphonePermission,
+                icon: microphonePermission ? Icons.mic : Icons.mic_none,
+              ),
+              _TinyStatusChip(
+                label: realtimeReady ? 'Realtime ready' : 'Realtime pending',
+                active: realtimeReady,
+                icon: Icons.graphic_eq_rounded,
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            backendBaseUrl,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.referenceMuted,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TinyStatusChip extends StatelessWidget {
+  const _TinyStatusChip({
+    required this.label,
+    required this.active,
+    required this.icon,
+  });
+
+  final String label;
+  final bool active;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = active ? AppColors.referenceGreen : AppColors.referenceMuted;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: active ? 0.12 : 0.08),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 5),
+          Text(
+            label,
+            style: TextStyle(
+              color: color,
+              fontSize: 11,
+              fontWeight: FontWeight.w900,
             ),
           ),
         ],

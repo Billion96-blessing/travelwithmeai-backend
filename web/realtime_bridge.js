@@ -9,6 +9,20 @@
   let providerLanguage = "Thai";
   let goalRecognition = null;
   let goalSpeechActive = false;
+  const defaultBackendBaseUrl = "https://travelwithmeai-server.onrender.com";
+  const customDomainBackendBaseUrl = "https://api.travelwithmeai.com";
+
+  function backendBaseUrl() {
+    const configured =
+      window.TRAVELWITHMEAI_API_BASE_URL ||
+      document.querySelector('meta[name="travelwithmeai-api-base-url"]')?.content ||
+      defaultBackendBaseUrl;
+    return String(configured).replace(/\/+$/, "");
+  }
+
+  function backendUrl(path) {
+    return `${backendBaseUrl()}${path.startsWith("/") ? path : `/${path}`}`;
+  }
 
   function emit(type, payload = {}) {
     if (emitToFlutter) {
@@ -72,7 +86,7 @@
     const cleanText = String(text || "").trim();
     if (!cleanText) return "";
 
-    const response = await fetch("http://127.0.0.1:3000/api/translate", {
+    const response = await fetch(backendUrl("/api/translate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -161,7 +175,15 @@
       emitToFlutter = onEvent;
       emit("status", { message: "Requesting microphone permission..." });
 
-      const tokenResponse = await fetch("http://127.0.0.1:3000/api/realtime-token", {
+      emit("backend_status", {
+        connected: false,
+        microphonePermission: false,
+        realtimeReady: false,
+        backendBaseUrl: backendBaseUrl(),
+        customDomainReady: customDomainBackendBaseUrl
+      });
+
+      const tokenResponse = await fetch(backendUrl("/api/realtime-token"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode: "negotiator", goal })
@@ -171,6 +193,14 @@
       if (!tokenResponse.ok) {
         throw new Error(tokenData.error || "Could not create realtime session.");
       }
+
+      emit("backend_status", {
+        connected: true,
+        microphonePermission: false,
+        realtimeReady: true,
+        backendBaseUrl: backendBaseUrl(),
+        customDomainReady: customDomainBackendBaseUrl
+      });
 
       const ephemeralKey = tokenData.value || tokenData.client_secret?.value;
       if (!ephemeralKey) {
@@ -260,6 +290,13 @@
           noiseSuppression: true,
           autoGainControl: true
         }
+      });
+      emit("backend_status", {
+        connected: true,
+        microphonePermission: true,
+        realtimeReady: true,
+        backendBaseUrl: backendBaseUrl(),
+        customDomainReady: customDomainBackendBaseUrl
       });
       micStream.getTracks().forEach((track) => peerConnection.addTrack(track, micStream));
 
