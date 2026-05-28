@@ -68,4 +68,10 @@ class RealtimeBridge {
       '{"type":"debug_result","name":"AI text reply","ok":true,"message":"Use the Android app for native AI text diagnostics. Chrome realtime uses the web bridge."}',
     );
   }
+
+  void toggleVoiceTurn(String goal, RealtimeEventCallback onEvent) {
+    onEvent(
+      '{"type":"status","message":"Use the Android app for native voice turn recording. Chrome keeps the web realtime bridge."}',
+    );
+  }
 }

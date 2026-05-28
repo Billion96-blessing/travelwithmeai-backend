@@ -11,7 +11,7 @@ import 'realtime_bridge.dart';
 
 const developerDebugMode = bool.fromEnvironment(
   'DEVELOPER_DEBUG',
-  defaultValue: true,
+  defaultValue: false,
 );
 
 void main() {
@@ -120,6 +120,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
   bool micMuted = false;
   bool goalRecording = false;
   bool goalProcessing = false;
+  bool liveRecording = false;
   bool backendConnected = false;
   bool microphonePermission = false;
   bool realtimeReady = false;
@@ -194,6 +195,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
       if (selectedTab == 1) {
         realtimeBridge.setMuted(true);
         micMuted = true;
+        liveRecording = false;
         trackEvent('app_backgrounded_live_session');
         saveLiveSnapshot();
       }
@@ -349,6 +351,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
       voiceState = VoiceState.thinking;
       selectedTab = 1;
       micMuted = false;
+      liveRecording = false;
       backendConnected = false;
       microphonePermission = false;
       realtimeReady = false;
@@ -364,7 +367,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
             title: 'Realtime session',
             text: 'Waiting for provider speech...',
             translation:
-                'Allow microphone access, then let the service provider speak near your Mac.',
+                'Allow microphone access, then let the service provider speak near your phone.',
           ),
         );
       aiMessages
@@ -412,14 +415,6 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           weakNetworkMode = true;
           realtimeRecovering = true;
           statusMessage = 'Weak network. Reconnecting smoothly...';
-          aiMessages.add(
-            const ConversationLine(
-              title: 'Recovery',
-              text: 'Reconnecting...',
-              translation:
-                  'Keeping the conversation ready while signal recovers.',
-            ),
-          );
         });
         realtimeBridge.stop();
         Future<void>.delayed(const Duration(milliseconds: 900), () {
@@ -434,6 +429,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
     setState(() {
       voiceState = VoiceState.paused;
       micMuted = true;
+      liveRecording = false;
       statusMessage = 'Muted. Tap unmute when you want to listen again.';
     });
   }
@@ -443,6 +439,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
     realtimeBridge.setMuted(nextMuted);
     setState(() {
       micMuted = nextMuted;
+      if (nextMuted) liveRecording = false;
       voiceState = micMuted ? VoiceState.paused : VoiceState.listening;
       statusMessage =
           micMuted ? 'Muted. The mic is paused.' : 'Listening again.';
@@ -456,6 +453,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
     setState(() {
       voiceState = VoiceState.ready;
       micMuted = false;
+      liveRecording = false;
       realtimeRecovering = false;
       weakNetworkMode = false;
       statusMessage = 'Realtime negotiation stopped.';
@@ -480,6 +478,20 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
     });
     realtimeBridge.testAiTextReply(handleRealtimeEvent);
   }
+
+  void handleLiveMic() {
+    if (lastPrivateGoal.isEmpty || !_isVoiceSessionActive) {
+      startNegotiation();
+      return;
+    }
+
+    realtimeBridge.toggleVoiceTurn(lastPrivateGoal, handleRealtimeEvent);
+  }
+
+  bool get _isVoiceSessionActive =>
+      backendConnected ||
+      microphonePermission ||
+      voiceState != VoiceState.ready;
 
   void approveDeal() {
     realtimeBridge.approve();
@@ -555,6 +567,31 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           statusMessage =
               data['message']?.toString() ?? 'Provider is speaking...';
           voiceState = VoiceState.providerSpeaking;
+        case 'recording_started':
+          liveRecording = true;
+          microphonePermission = true;
+          statusMessage =
+              data['message']?.toString() ?? 'Recording. Tap mic to send.';
+          voiceState = VoiceState.providerSpeaking;
+        case 'recording_stopped':
+          liveRecording = false;
+          statusMessage = data['message']?.toString() ?? 'Recording stopped.';
+          voiceState = VoiceState.thinking;
+        case 'audio_sent':
+          liveRecording = false;
+          statusMessage =
+              data['message']?.toString() ?? 'Audio sent. AI is thinking.';
+          voiceState = VoiceState.thinking;
+        case 'audio_playback_started':
+          statusMessage =
+              data['message']?.toString() ?? 'AI voice playback started.';
+          voiceState = VoiceState.speaking;
+        case 'audio_playback_ended':
+          statusMessage = data['message']?.toString() ?? 'Listening';
+          voiceState = VoiceState.listening;
+        case 'voice_log':
+          final message = data['message']?.toString() ?? 'Voice event';
+          debugStatusMessage = message;
         case 'backend_status':
           backendConnected = data['connected'] == true;
           microphonePermission = data['microphonePermission'] == true;
@@ -575,6 +612,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           statusMessage = data['message']?.toString() ?? 'Permission needed';
           voiceState = VoiceState.ready;
           microphonePermission = false;
+          liveRecording = false;
         case 'debug_result':
           final name = data['name']?.toString() ?? 'Diagnostic';
           final ok = data['ok'] == true;
@@ -698,6 +736,11 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
                 aiMessages[index].copyWith(title: 'AI speaking');
           }
           saveLiveSnapshot();
+        case 'approval_needed':
+          approvalRequired = true;
+          statusMessage =
+              data['message']?.toString() ?? 'Do you approve this deal?';
+          selectedTab = 2;
         case 'approved':
           statusMessage = data['message']?.toString() ??
               'Approved. AI is confirming in $providerLanguage.';
@@ -709,6 +752,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           voiceState = VoiceState.ready;
           backendConnected = false;
           realtimeReady = false;
+          liveRecording = false;
           realtimeRecovering = true;
           weakNetworkMode = true;
           trackEvent('realtime_error');
@@ -854,6 +898,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
         return _LiveConversationSection(
           state: voiceState,
           micMuted: micMuted,
+          liveRecording: liveRecording,
           backendConnected: backendConnected,
           microphonePermission: microphonePermission,
           realtimeReady: realtimeReady,
@@ -862,7 +907,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           weakNetworkMode: weakNetworkMode,
           providerMessages: providerMessages,
           aiMessages: aiMessages,
-          onMic: startNegotiation,
+          onMic: handleLiveMic,
           onMuteToggle: toggleMicMute,
           onPause: pauseNegotiation,
           onStop: stopNegotiation,
@@ -1725,6 +1770,7 @@ class _LiveConversationSection extends StatefulWidget {
   const _LiveConversationSection({
     required this.state,
     required this.micMuted,
+    required this.liveRecording,
     required this.backendConnected,
     required this.microphonePermission,
     required this.realtimeReady,
@@ -1746,6 +1792,7 @@ class _LiveConversationSection extends StatefulWidget {
 
   final VoiceState state;
   final bool micMuted;
+  final bool liveRecording;
   final bool backendConnected;
   final bool microphonePermission;
   final bool realtimeReady;
@@ -1822,19 +1869,21 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
         ? 'Muted'
         : !widget.microphonePermission
             ? 'Permission needed'
-            : widget.recovering
-                ? 'Reconnecting'
-                : !widget.backendConnected
-                    ? 'Connecting'
-                    : widget.state == VoiceState.providerSpeaking
-                        ? 'Provider Speaking'
-                        : widget.state == VoiceState.speaking
-                            ? 'AI Speaking'
-                            : widget.state == VoiceState.thinking
-                                ? 'AI Thinking'
-                                : widget.state == VoiceState.listening
-                                    ? 'Listening'
-                                    : 'Waiting';
+            : widget.liveRecording
+                ? 'Recording'
+                : widget.recovering
+                    ? 'Reconnecting'
+                    : !widget.backendConnected
+                        ? 'Connecting'
+                        : widget.state == VoiceState.providerSpeaking
+                            ? 'Provider Speaking'
+                            : widget.state == VoiceState.speaking
+                                ? 'AI Speaking'
+                                : widget.state == VoiceState.thinking
+                                    ? 'AI Thinking'
+                                    : widget.state == VoiceState.listening
+                                        ? 'Listening'
+                                        : 'Waiting';
 
     return Container(
       clipBehavior: Clip.antiAlias,
@@ -1942,11 +1991,10 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
                 _BigLiveMicButton(
                   permissionGranted: widget.microphonePermission,
                   muted: widget.micMuted,
+                  recording: widget.liveRecording,
                   listening: widget.state == VoiceState.listening ||
                       widget.state == VoiceState.providerSpeaking,
-                  onPressed: widget.microphonePermission
-                      ? widget.onMuteToggle
-                      : widget.onMic,
+                  onPressed: widget.onMic,
                 ),
                 if (developerDebugMode) ...[
                   const SizedBox(height: 12),
@@ -2236,12 +2284,14 @@ class _BigLiveMicButton extends StatelessWidget {
   const _BigLiveMicButton({
     required this.permissionGranted,
     required this.muted,
+    required this.recording,
     required this.listening,
     required this.onPressed,
   });
 
   final bool permissionGranted;
   final bool muted;
+  final bool recording;
   final bool listening;
   final VoidCallback onPressed;
 
@@ -2252,10 +2302,16 @@ class _BigLiveMicButton extends StatelessWidget {
         ? 'Tap to allow microphone'
         : muted
             ? 'Tap to unmute'
-            : listening
-                ? 'Listening'
-                : 'Tap to start listening';
-    final icon = !permissionGranted || muted ? Icons.mic_off : Icons.mic;
+            : recording
+                ? 'Recording... tap to send'
+                : listening
+                    ? 'Tap to record provider'
+                    : 'Tap to start listening';
+    final icon = !permissionGranted || muted
+        ? Icons.mic_off
+        : recording
+            ? Icons.stop_circle
+            : Icons.mic;
     return AnimatedContainer(
       duration: const Duration(milliseconds: 240),
       width: double.infinity,
