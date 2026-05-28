@@ -135,19 +135,20 @@
     return [
       `Begin in polite, natural ${providerLanguage}.`,
       `Speak only ${providerLanguage} to the service provider unless the user changes the provider language.`,
-      `Your first message must: greet the provider, say you are helping your friend/customer communicate, briefly say the customer wants ${request}, then ask the price.`,
-      "Example meaning: Hello, I am helping my friend/customer communicate. They want this service. May I ask the price?",
+      `Your first message must be short: greet the provider, say you are helping your friend communicate, say they want ${request}, then ask the price.`,
+      "Use normal human wording like: Hi, I am helping my friend communicate. How much is it?",
       "After the first message, negotiate on behalf of the user.",
-      "Talk like a normal friendly person, not like a complicated AI.",
-      "Close the deal faster. Keep each turn under one or two short sentences.",
-      "Use short, straight questions: How much can you reduce? What is the final price? What is included? Pickup and drop-off included? Any extra fee?",
-      "Use direct counteroffers like: Okay, can you do 1500?",
+      "Talk like a normal helpful person, not like a robot or formal assistant.",
+      "Keep every turn very short, polite, direct, and natural.",
+      "Use short questions: Can you reduce a little? Is that the final price? What is included? Pickup included? Any extra fee?",
+      "Use direct counteroffers like: Can you do 1500?",
+      "If the deal sounds ready, say: Okay, let me ask my friend first.",
       "Be context-aware. For taxi or rental car, ask about toll fee, waiting time, pickup/drop-off, luggage, route, and extra charge; do not ask about fuel unless relevant.",
       "For boat, ask about life jacket, round trip, island fee, pickup point, safety, and duration.",
       "For hotel, ask about tax, breakfast, deposit, and late checkout.",
       "For shopping, ask about discount, warranty, original/fake, and delivery.",
       "Do not reveal the user's private budget or private goal.",
-      "Do not finalize a deal until user approval."
+      "Never confirm or finalize a deal until user approval."
     ].join(" ");
   }
 
@@ -336,12 +337,21 @@
           emit("ai_delta", { text: data.delta, transcript: aiTurnTranscript });
         }
 
+        if (data.type === "input_audio_buffer.speech_started") {
+          emit("provider_speaking", { message: "Provider speaking..." });
+        }
+
+        if (data.type === "input_audio_buffer.speech_stopped") {
+          emit("status", { message: "AI thinking..." });
+        }
+
         if (data.type === "conversation.item.input_audio_transcription.completed" && data.transcript) {
           const providerText = data.transcript;
           emit("provider_transcript", {
             text: providerText,
             translation: `Translating to ${targetLanguage}...`
           });
+          emit("status", { message: "AI thinking..." });
           translateText(providerText, targetLanguage)
             .then((translation) => emit("provider_translation", { text: providerText, translation }))
             .catch((error) => emit("provider_translation", {

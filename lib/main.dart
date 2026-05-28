@@ -358,6 +358,10 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
           statusMessage = message;
           voiceState = voiceStateFromStatus(message);
           updateConnectionFlagsFromStatus(message);
+        case 'provider_speaking':
+          statusMessage =
+              data['message']?.toString() ?? 'Provider is speaking...';
+          voiceState = VoiceState.providerSpeaking;
         case 'backend_status':
           backendConnected = data['connected'] == true;
           microphonePermission = data['microphonePermission'] == true;
@@ -640,6 +644,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
           onPause: pauseNegotiation,
           onStop: stopNegotiation,
           onAccept: approveDeal,
+          onReject: rejectDeal,
         );
       case 2:
         return Column(
@@ -1490,7 +1495,7 @@ class _NegotiationPlanSection extends StatelessWidget {
   }
 }
 
-class _LiveConversationSection extends StatelessWidget {
+class _LiveConversationSection extends StatefulWidget {
   const _LiveConversationSection({
     required this.state,
     required this.micMuted,
@@ -1505,6 +1510,7 @@ class _LiveConversationSection extends StatelessWidget {
     required this.onPause,
     required this.onStop,
     required this.onAccept,
+    required this.onReject,
   });
 
   final VoiceState state;
@@ -1520,53 +1526,99 @@ class _LiveConversationSection extends StatelessWidget {
   final VoidCallback onPause;
   final VoidCallback onStop;
   final VoidCallback onAccept;
+  final VoidCallback onReject;
+
+  @override
+  State<_LiveConversationSection> createState() =>
+      _LiveConversationSectionState();
+}
+
+class _LiveConversationSectionState extends State<_LiveConversationSection> {
+  final scrollController = ScrollController();
+
+  @override
+  void didUpdateWidget(covariant _LiveConversationSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final changed =
+        oldWidget.providerMessages.length != widget.providerMessages.length ||
+            oldWidget.aiMessages.length != widget.aiMessages.length ||
+            oldWidget.state != widget.state;
+    if (changed) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => scrollToLatest());
+    }
+  }
+
+  void scrollToLatest() {
+    if (!scrollController.hasClients) return;
+    scrollController.animateTo(
+      scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  @override
+  void dispose() {
+    scrollController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final providerLine = providerMessages.isNotEmpty
-        ? providerMessages.last
-        : const ConversationLine(
-            title: 'Provider original',
-            text: 'Halo! Tur perahu \$200 untuk 4 orang.',
-            translation: 'Hello! Boat tour is \$200 for 4 people.',
-          );
-    final aiLine = aiMessages.isNotEmpty
-        ? aiMessages.last
-        : const ConversationLine(
-            title: 'AI speaking',
-            text: 'Can you reduce the price a bit? What is included?',
-            translation:
-                'The AI is asking for a discount and included details.',
-          );
-    final maxLength = providerMessages.length > aiMessages.length
-        ? providerMessages.length
-        : aiMessages.length;
-    final statusLabel = micMuted
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final colorScheme = theme.colorScheme;
+    final messages = <_LiveChatItem>[];
+    final maxLength = widget.providerMessages.length > widget.aiMessages.length
+        ? widget.providerMessages.length
+        : widget.aiMessages.length;
+
+    for (var index = 0; index < maxLength; index += 1) {
+      if (index < widget.providerMessages.length) {
+        messages.add(_LiveChatItem(widget.providerMessages[index], false));
+      }
+      if (index < widget.aiMessages.length) {
+        messages.add(_LiveChatItem(widget.aiMessages[index], true));
+      }
+    }
+
+    final statusLabel = widget.micMuted
         ? 'Muted'
-        : state == VoiceState.speaking
-            ? 'AI Speaking'
-            : state == VoiceState.thinking
-                ? 'AI Thinking'
-                : state == VoiceState.listening
-                    ? 'Listening'
-                    : maxLength > 0
-                        ? 'Provider Speaking'
-                        : 'Listening';
+        : widget.state == VoiceState.providerSpeaking
+            ? 'Provider Speaking'
+            : widget.state == VoiceState.speaking
+                ? 'AI Speaking'
+                : widget.state == VoiceState.thinking
+                    ? 'AI Thinking'
+                    : widget.state == VoiceState.listening
+                        ? 'Listening'
+                        : 'Waiting';
 
     return Container(
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(28),
-        gradient: const LinearGradient(
+        gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [Color(0xFFEAF3FF), Color(0xFFEFF9FF), Color(0xFFD4F7FF)],
+          colors: isDark
+              ? [
+                  colorScheme.surface.withValues(alpha: 0.92),
+                  colorScheme.surfaceContainerHighest.withValues(alpha: 0.72),
+                ]
+              : [
+                  colorScheme.surface,
+                  colorScheme.primaryContainer.withValues(alpha: 0.36),
+                ],
         ),
-        boxShadow: const [
+        border: Border.all(
+          color: isDark ? AppColors.darkLine : AppColors.lightBorder,
+        ),
+        boxShadow: [
           BoxShadow(
-            color: Color(0x1B3B82F6),
+            color: colorScheme.shadow.withValues(alpha: isDark ? 0.28 : 0.10),
             blurRadius: 34,
-            offset: Offset(0, 14),
+            offset: const Offset(0, 14),
           ),
         ],
       ),
@@ -1574,71 +1626,98 @@ class _LiveConversationSection extends StatelessWidget {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Live Negotiation',
+                        style: TextStyle(
+                          color: colorScheme.onSurface,
+                          fontSize: 24,
+                          height: 1.05,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Boat Tour • Bali',
+                        style: TextStyle(
+                          color: colorScheme.onSurfaceVariant,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                _LiveStatusPill(
+                  status: statusLabel,
+                  active: !widget.micMuted,
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
             child: Column(
               children: [
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Live Negotiation',
-                            style: TextStyle(
-                              color: AppColors.referenceInk,
-                              fontSize: 24,
-                              height: 1.05,
-                              fontWeight: FontWeight.w900,
-                            ),
-                          ),
-                          SizedBox(height: 6),
-                          Text(
-                            'Boat Tour • Bali',
-                            style: TextStyle(
-                              color: AppColors.referenceMuted,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    _LiveStatusPill(status: statusLabel, active: !micMuted),
-                  ],
-                ),
-                const SizedBox(height: 18),
                 const _LiveBudgetCard(),
                 const SizedBox(height: 12),
                 _BackendStatusStrip(
-                  connected: backendConnected,
-                  microphonePermission: microphonePermission,
-                  realtimeReady: realtimeReady,
-                  backendBaseUrl: backendBaseUrl,
+                  connected: widget.backendConnected,
+                  microphonePermission: widget.microphonePermission,
+                  realtimeReady: widget.realtimeReady,
+                  backendBaseUrl: widget.backendBaseUrl,
                 ),
                 const SizedBox(height: 16),
-                _ReferenceChatBubble(line: providerLine, isAi: false),
-                const SizedBox(height: 14),
-                _ReferenceChatBubble(line: aiLine, isAi: true),
-                const SizedBox(height: 34),
-                _ReferenceWaveCard(state: state, muted: micMuted),
-                const SizedBox(height: 108),
+                SizedBox(
+                  height: 330,
+                  child: ListView.separated(
+                    controller: scrollController,
+                    physics: const BouncingScrollPhysics(),
+                    padding: const EdgeInsets.only(bottom: 12),
+                    itemCount: messages.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 12),
+                    itemBuilder: (context, index) {
+                      final item = messages[index];
+                      return _ReferenceChatBubble(
+                        line: item.line,
+                        isAi: item.isAi,
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _ReferenceWaveCard(state: widget.state, muted: widget.micMuted),
+                const SizedBox(height: 18),
               ],
             ),
           ),
           Container(
             width: double.infinity,
             padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
-            decoration: const BoxDecoration(color: Color(0xFFF8FAFC)),
+            decoration: BoxDecoration(
+              color:
+                  colorScheme.surface.withValues(alpha: isDark ? 0.86 : 0.96),
+              border: Border(
+                top: BorderSide(
+                  color: isDark ? AppColors.darkLine : AppColors.lightBorder,
+                ),
+              ),
+            ),
             child: Column(
               children: [
                 Row(
                   children: [
                     Expanded(
                       child: _ReferenceControlButton(
-                        icon: micMuted ? Icons.mic_off : Icons.mic,
-                        label: micMuted ? 'Unmute' : 'Mute',
-                        onPressed: onMuteToggle,
+                        icon: widget.micMuted ? Icons.mic_off : Icons.mic,
+                        label: widget.micMuted ? 'Unmute' : 'Mute',
+                        onPressed: widget.onMuteToggle,
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -1646,7 +1725,7 @@ class _LiveConversationSection extends StatelessWidget {
                       child: _ReferenceControlButton(
                         icon: Icons.pause,
                         label: 'Pause',
-                        onPressed: onPause,
+                        onPressed: widget.onPause,
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -1654,13 +1733,23 @@ class _LiveConversationSection extends StatelessWidget {
                       child: _ReferenceControlButton(
                         icon: Icons.stop_rounded,
                         label: 'Stop',
-                        onPressed: onStop,
+                        onPressed: widget.onStop,
                       ),
                     ),
                   ],
                 ),
                 const SizedBox(height: 12),
-                _ReferenceAcceptButton(onPressed: onAccept),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _ReferenceAcceptButton(onPressed: widget.onAccept),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _ReferenceRejectButton(onPressed: widget.onReject),
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -1668,6 +1757,13 @@ class _LiveConversationSection extends StatelessWidget {
       ),
     );
   }
+}
+
+class _LiveChatItem {
+  const _LiveChatItem(this.line, this.isAi);
+
+  final ConversationLine line;
+  final bool isAi;
 }
 
 class _LiveStatusPill extends StatelessWidget {
@@ -1678,15 +1774,16 @@ class _LiveStatusPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final activeColor = active ? colorScheme.primary : colorScheme.error;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-        color: active ? AppColors.referenceGreen : AppColors.red,
+        color: activeColor,
         borderRadius: BorderRadius.circular(999),
         boxShadow: [
           BoxShadow(
-            color: (active ? AppColors.referenceGreen : AppColors.red)
-                .withValues(alpha: 0.35),
+            color: activeColor.withValues(alpha: 0.28),
             blurRadius: 18,
             offset: const Offset(0, 9),
           ),
@@ -1698,7 +1795,7 @@ class _LiveStatusPill extends StatelessWidget {
           const Icon(Icons.circle, color: Colors.white, size: 12),
           const SizedBox(width: 6),
           Text(
-            active ? 'Active' : status,
+            status,
             style: const TextStyle(
               color: Colors.white,
               fontWeight: FontWeight.w900,
@@ -1726,18 +1823,23 @@ class _BackendStatusStrip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.86),
+        color: colorScheme.surface.withValues(alpha: isDark ? 0.62 : 0.86),
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: Colors.white, width: 1.4),
-        boxShadow: const [
+        border: Border.all(
+            color: isDark ? AppColors.darkLine : AppColors.lightBorder,
+            width: 1.4),
+        boxShadow: [
           BoxShadow(
-            color: Color(0x08000000),
+            color: colorScheme.shadow.withValues(alpha: isDark ? 0.20 : 0.06),
             blurRadius: 16,
-            offset: Offset(0, 8),
+            offset: const Offset(0, 8),
           ),
         ],
       ),
@@ -1772,8 +1874,8 @@ class _BackendStatusStrip extends StatelessWidget {
             backendBaseUrl,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: AppColors.referenceMuted,
+            style: TextStyle(
+              color: colorScheme.onSurfaceVariant,
               fontSize: 11,
               fontWeight: FontWeight.w700,
             ),
@@ -1797,7 +1899,8 @@ class _TinyStatusChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = active ? AppColors.referenceGreen : AppColors.referenceMuted;
+    final colorScheme = Theme.of(context).colorScheme;
+    final color = active ? colorScheme.primary : colorScheme.onSurfaceVariant;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
       decoration: BoxDecoration(
@@ -1828,40 +1931,48 @@ class _LiveBudgetCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: colorScheme.surface.withValues(alpha: isDark ? 0.68 : 0.92),
         borderRadius: BorderRadius.circular(18),
-        boxShadow: const [
+        border: Border.all(
+          color: isDark ? AppColors.darkLine : AppColors.lightBorder,
+        ),
+        boxShadow: [
           BoxShadow(
-              color: Color(0x08000000), blurRadius: 16, offset: Offset(0, 8))
+            color: colorScheme.shadow.withValues(alpha: isDark ? 0.18 : 0.05),
+            blurRadius: 16,
+            offset: const Offset(0, 8),
+          )
         ],
       ),
       child: Column(
         children: [
-          const Row(
+          Row(
             children: [
-              Icon(Icons.circle, color: AppColors.referenceBlue, size: 8),
-              SizedBox(width: 8),
+              Icon(Icons.circle, color: colorScheme.primary, size: 8),
+              const SizedBox(width: 8),
               Expanded(
                 child: Text(
                   'Budget: \$100',
                   style: TextStyle(
-                    color: AppColors.referenceInk,
+                    color: colorScheme.onSurface,
                     fontSize: 15,
                     fontWeight: FontWeight.w900,
                   ),
                 ),
               ),
-              Icon(Icons.trending_down,
-                  color: AppColors.referencePurple, size: 18),
-              SizedBox(width: 5),
+              Icon(Icons.trending_down, color: colorScheme.secondary, size: 18),
+              const SizedBox(width: 5),
               Text(
                 '\$160',
                 style: TextStyle(
-                  color: AppColors.referencePurple,
+                  color: colorScheme.secondary,
                   fontSize: 15,
                   fontWeight: FontWeight.w900,
                 ),
@@ -1873,16 +1984,19 @@ class _LiveBudgetCard extends StatelessWidget {
             borderRadius: BorderRadius.circular(999),
             child: Stack(
               children: [
-                Container(height: 9, color: const Color(0xFFF1F3F7)),
+                Container(
+                    height: 9,
+                    color: colorScheme.surfaceContainerHighest
+                        .withValues(alpha: 0.55)),
                 FractionallySizedBox(
                   widthFactor: 0.62,
                   child: Container(
                     height: 9,
-                    decoration: const BoxDecoration(
+                    decoration: BoxDecoration(
                       gradient: LinearGradient(
                         colors: [
-                          AppColors.referenceBlue,
-                          AppColors.referencePurple,
+                          colorScheme.primary,
+                          colorScheme.secondary,
                         ],
                       ),
                     ),
@@ -1892,12 +2006,12 @@ class _LiveBudgetCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 10),
-          const Align(
+          Align(
             alignment: Alignment.centerLeft,
             child: Text(
               'AI saved you \$40 so far',
               style: TextStyle(
-                color: AppColors.referenceMuted,
+                color: colorScheme.onSurfaceVariant,
                 fontSize: 13,
                 fontWeight: FontWeight.w700,
               ),
@@ -1917,7 +2031,13 @@ class _ReferenceChatBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
     final width = MediaQuery.sizeOf(context).width;
+    final aiColor = colorScheme.primary;
+    final providerColor =
+        colorScheme.surface.withValues(alpha: isDark ? 0.72 : 0.96);
     return Align(
       alignment: isAi ? Alignment.centerRight : Alignment.centerLeft,
       child: ConstrainedBox(
@@ -1925,16 +2045,21 @@ class _ReferenceChatBubble extends StatelessWidget {
         child: Container(
           padding: EdgeInsets.fromLTRB(isAi ? 18 : 16, 16, 16, 14),
           decoration: BoxDecoration(
-            color: isAi ? AppColors.referenceBlue : Colors.white,
+            color: isAi ? aiColor : providerColor,
             borderRadius: BorderRadius.only(
               topLeft: const Radius.circular(18),
               topRight: const Radius.circular(18),
               bottomLeft: Radius.circular(isAi ? 18 : 5),
               bottomRight: Radius.circular(isAi ? 5 : 18),
             ),
+            border: isAi
+                ? null
+                : Border.all(
+                    color: isDark ? AppColors.darkLine : AppColors.lightBorder,
+                  ),
             boxShadow: [
               BoxShadow(
-                color: (isAi ? AppColors.referenceBlue : Colors.black)
+                color: (isAi ? aiColor : colorScheme.shadow)
                     .withValues(alpha: isAi ? 0.22 : 0.05),
                 blurRadius: isAi ? 18 : 12,
                 offset: const Offset(0, 9),
@@ -1957,18 +2082,19 @@ class _ProviderBubbleContent extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           children: [
-            const Icon(Icons.translate, color: Color(0xFF0EA5E9), size: 20),
+            Icon(Icons.translate, color: colorScheme.primary, size: 20),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
                 line.text,
-                style: const TextStyle(
-                  color: AppColors.referenceMuted,
+                style: TextStyle(
+                  color: colorScheme.onSurfaceVariant,
                   fontStyle: FontStyle.italic,
                   fontWeight: FontWeight.w800,
                   fontSize: 16,
@@ -1981,19 +2107,19 @@ class _ProviderBubbleContent extends StatelessWidget {
         Container(
           height: 1,
           margin: const EdgeInsets.symmetric(vertical: 14),
-          color: const Color(0xFFE9EDF3),
+          color: colorScheme.outlineVariant.withValues(alpha: 0.55),
         ),
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.chat_bubble_outline,
-                color: AppColors.referenceBlue, size: 20),
+            Icon(Icons.chat_bubble_outline,
+                color: colorScheme.primary, size: 20),
             const SizedBox(width: 10),
             Expanded(
               child: Text(
                 line.translation,
-                style: const TextStyle(
-                  color: AppColors.referenceInk,
+                style: TextStyle(
+                  color: colorScheme.onSurface,
                   fontSize: 19,
                   height: 1.35,
                   fontWeight: FontWeight.w700,
@@ -2003,12 +2129,12 @@ class _ProviderBubbleContent extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 12),
-        const Align(
+        Align(
           alignment: Alignment.centerRight,
           child: Text(
-            '01:56 PM',
+            'Now · translated',
             style: TextStyle(
-              color: Color(0xFF9CA3AF),
+              color: colorScheme.onSurfaceVariant,
               fontSize: 13,
               fontWeight: FontWeight.w600,
             ),
@@ -2026,20 +2152,21 @@ class _AiBubbleContent extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.chat_bubble_outline,
-                color: Colors.white, size: 20),
+            Icon(Icons.chat_bubble_outline,
+                color: colorScheme.onPrimary, size: 20),
             const SizedBox(width: 10),
             Expanded(
               child: Text(
                 line.text,
-                style: const TextStyle(
-                  color: Colors.white,
+                style: TextStyle(
+                  color: colorScheme.onPrimary,
                   fontSize: 18,
                   height: 1.36,
                   fontWeight: FontWeight.w800,
@@ -2054,7 +2181,7 @@ class _AiBubbleContent extends StatelessWidget {
           child: Text(
             line.translation,
             style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.78),
+              color: colorScheme.onPrimary.withValues(alpha: 0.78),
               fontSize: 13,
               height: 1.3,
               fontWeight: FontWeight.w600,
@@ -2062,12 +2189,12 @@ class _AiBubbleContent extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 12),
-        const Align(
+        Align(
           alignment: Alignment.centerRight,
           child: Text(
-            '01:56 PM',
+            'Now · AI',
             style: TextStyle(
-              color: Color(0xCCEAF2FF),
+              color: colorScheme.onPrimary.withValues(alpha: 0.78),
               fontSize: 13,
               fontWeight: FontWeight.w600,
             ),
@@ -2088,22 +2215,32 @@ class _ReferenceWaveCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final label = muted
         ? 'Muted'
-        : state == VoiceState.speaking
-            ? 'AI is speaking...'
-            : state == VoiceState.thinking
-                ? 'AI is thinking...'
-                : state == VoiceState.listening
-                    ? 'Listening...'
-                    : 'AI is negotiating...';
+        : state == VoiceState.providerSpeaking
+            ? 'Provider speaking...'
+            : state == VoiceState.speaking
+                ? 'AI is speaking...'
+                : state == VoiceState.thinking
+                    ? 'AI is thinking...'
+                    : state == VoiceState.listening
+                        ? 'Listening...'
+                        : 'Waiting...';
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
     return Center(
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 20),
         decoration: BoxDecoration(
-          color: Colors.white,
+          color: colorScheme.surface.withValues(alpha: isDark ? 0.70 : 0.94),
           borderRadius: BorderRadius.circular(24),
-          boxShadow: const [
+          border: Border.all(
+              color: isDark ? AppColors.darkLine : AppColors.lightBorder),
+          boxShadow: [
             BoxShadow(
-                color: Color(0x08000000), blurRadius: 14, offset: Offset(0, 8))
+              color: colorScheme.shadow.withValues(alpha: isDark ? 0.20 : 0.06),
+              blurRadius: 14,
+              offset: const Offset(0, 8),
+            )
           ],
         ),
         child: Row(
@@ -2115,8 +2252,8 @@ class _ReferenceWaveCard extends StatelessWidget {
               child: Text(
                 label,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Color(0xFF475569),
+                style: TextStyle(
+                  color: colorScheme.onSurfaceVariant,
                   fontSize: 15,
                   fontWeight: FontWeight.w800,
                 ),
@@ -2139,13 +2276,15 @@ class _MiniWave extends StatelessWidget {
   Widget build(BuildContext context) {
     final active = !muted &&
         (state == VoiceState.listening ||
+            state == VoiceState.providerSpeaking ||
             state == VoiceState.speaking ||
             state == VoiceState.thinking);
     final heights = active ? [26.0, 42.0, 32.0] : [18.0, 18.0, 18.0];
-    const colors = [
-      AppColors.referenceBlue,
-      Color(0xFF06B6D4),
-      AppColors.referencePurple,
+    final colorScheme = Theme.of(context).colorScheme;
+    final colors = [
+      colorScheme.primary,
+      colorScheme.tertiary,
+      colorScheme.secondary,
     ];
     return SizedBox(
       height: 46,
@@ -2181,13 +2320,19 @@ class _ReferenceControlButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
     return SizedBox(
       height: 58,
       child: OutlinedButton.icon(
         style: OutlinedButton.styleFrom(
-          backgroundColor: Colors.white,
-          foregroundColor: AppColors.referenceInk,
-          side: const BorderSide(color: Color(0xFFE2E8F0), width: 1.6),
+          backgroundColor:
+              colorScheme.surface.withValues(alpha: isDark ? 0.72 : 0.96),
+          foregroundColor: colorScheme.onSurface,
+          side: BorderSide(
+              color: isDark ? AppColors.darkLine : AppColors.lightBorder,
+              width: 1.6),
           shape:
               RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
@@ -2207,22 +2352,53 @@ class _ReferenceAcceptButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     return SizedBox(
       height: 66,
       width: double.infinity,
       child: FilledButton.icon(
         style: FilledButton.styleFrom(
-          backgroundColor: AppColors.referenceGreen,
-          foregroundColor: Colors.white,
+          backgroundColor: colorScheme.primary,
+          foregroundColor: colorScheme.onPrimary,
           shape:
               RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
           elevation: 0,
-          shadowColor: AppColors.referenceGreen,
+          shadowColor: colorScheme.primary,
         ),
         onPressed: onPressed,
         icon: const Icon(Icons.check, size: 22),
-        label: const Text('Accept Deal - \$160'),
+        label: Text(
+          'Approve',
+          style: TextStyle(color: colorScheme.onPrimary),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReferenceRejectButton extends StatelessWidget {
+  const _ReferenceRejectButton({required this.onPressed});
+
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: 66,
+      width: double.infinity,
+      child: OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: colorScheme.error,
+          side: BorderSide(color: colorScheme.error.withValues(alpha: 0.45)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
+        ),
+        onPressed: onPressed,
+        icon: const Icon(Icons.close_rounded, size: 22),
+        label: const Text('Reject'),
       ),
     );
   }
@@ -3208,6 +3384,7 @@ class _InsetPanel extends StatelessWidget {
 enum VoiceState {
   ready('Ready', Icons.radio_button_checked, AppColors.muted),
   listening('Listening', Icons.hearing, AppColors.cyan),
+  providerSpeaking('Provider Speaking', Icons.record_voice_over, AppColors.sky),
   thinking('Thinking', Icons.psychology_alt_outlined, AppColors.gold),
   speaking('Speaking', Icons.graphic_eq, AppColors.green),
   paused('Paused', Icons.pause_circle_outline, AppColors.violet);
