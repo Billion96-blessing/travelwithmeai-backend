@@ -3,6 +3,10 @@ package com.travelwithmeai.app
 import android.Manifest
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder.AudioSource
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.speech.tts.TextToSpeech
@@ -21,11 +25,14 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileInputStream
 import java.util.Locale
+import java.util.concurrent.Executors
+import kotlin.concurrent.thread
 
 class MainActivity : FlutterActivity() {
     private val channelName = "travelbuddy_ai/native"
     private val logTag = "TravelBuddyVoice"
     private val microphoneRequestCode = 4107
+    private lateinit var nativeChannel: MethodChannel
     private var pendingMicResult: MethodChannel.Result? = null
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
@@ -33,26 +40,45 @@ class MainActivity : FlutterActivity() {
     private var player: MediaPlayer? = null
     private var textToSpeech: TextToSpeech? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val audioExecutor = Executors.newSingleThreadExecutor()
+    private var realtimeRecorder: AudioRecord? = null
+    @Volatile private var realtimeCapturing = false
+    private var realtimeCaptureThread: Thread? = null
+    private var realtimeAudioTrack: AudioTrack? = null
+    private var realtimePlaybackStarted = false
+    private var realtimeAudioChunkCount = 0
+    private var realtimePlaybackChunkCount = 0
+
+    companion object {
+        private const val REALTIME_SAMPLE_RATE = 24000
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "requestMicrophonePermission" -> requestMicrophonePermission(result)
-                    "startVoiceRecording" -> startVoiceRecording(result)
-                    "stopVoiceRecording" -> stopVoiceRecording(result)
-                    "cancelVoiceRecording" -> cancelVoiceRecording(result)
-                    "playAudioBase64" -> {
-                        val audioBase64 = call.argument<String>("audioBase64") ?: ""
-                        val mimeType = call.argument<String>("mimeType") ?: "audio/mpeg"
-                        val fallbackText = call.argument<String>("fallbackText") ?: ""
-                        playAudioBase64(audioBase64, mimeType, fallbackText, result)
-                    }
-                    "stopPlayback" -> stopPlayback(result)
-                    else -> result.notImplemented()
+        nativeChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+        nativeChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "requestMicrophonePermission" -> requestMicrophonePermission(result)
+                "startVoiceRecording" -> startVoiceRecording(result)
+                "stopVoiceRecording" -> stopVoiceRecording(result)
+                "cancelVoiceRecording" -> cancelVoiceRecording(result)
+                "startRealtimeAudioCapture" -> startRealtimeAudioCapture(result)
+                "stopRealtimeAudioCapture" -> stopRealtimeAudioCapture(result)
+                "playRealtimeAudioChunk" -> {
+                    val audioBase64 = call.argument<String>("audioBase64") ?: ""
+                    playRealtimeAudioChunk(audioBase64, result)
                 }
+                "stopRealtimeAudioPlayback" -> stopRealtimeAudioPlayback(result)
+                "playAudioBase64" -> {
+                    val audioBase64 = call.argument<String>("audioBase64") ?: ""
+                    val mimeType = call.argument<String>("mimeType") ?: "audio/mpeg"
+                    val fallbackText = call.argument<String>("fallbackText") ?: ""
+                    playAudioBase64(audioBase64, mimeType, fallbackText, result)
+                }
+                "stopPlayback" -> stopPlayback(result)
+                else -> result.notImplemented()
             }
+        }
     }
 
     private fun requestMicrophonePermission(result: MethodChannel.Result) {
@@ -83,6 +109,206 @@ class MainActivity : FlutterActivity() {
             pendingMicResult?.success(granted)
             pendingMicResult = null
         }
+    }
+
+    private fun startRealtimeAudioCapture(result: MethodChannel.Result) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            voiceLog("realtime_mic_permission_missing")
+            result.error("MIC_PERMISSION", "Microphone permission is required.", null)
+            return
+        }
+
+        if (realtimeCapturing) {
+            result.success(true)
+            return
+        }
+
+        try {
+            val minBuffer = AudioRecord.getMinBufferSize(
+                REALTIME_SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val bufferSize = maxOf(minBuffer, REALTIME_SAMPLE_RATE / 5 * 2)
+            val nextRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                AudioRecord.Builder()
+                    .setAudioSource(AudioSource.VOICE_RECOGNITION)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setSampleRate(REALTIME_SAMPLE_RATE)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufferSize)
+                    .build()
+            } else {
+                @Suppress("DEPRECATION")
+                AudioRecord(
+                    AudioSource.VOICE_RECOGNITION,
+                    REALTIME_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize
+                )
+            }
+
+            if (nextRecorder.state != AudioRecord.STATE_INITIALIZED) {
+                nextRecorder.release()
+                result.error("REALTIME_RECORD_INIT_FAILED", "AudioRecord failed to initialize.", null)
+                return
+            }
+
+            realtimeRecorder = nextRecorder
+            realtimeCapturing = true
+            realtimeAudioChunkCount = 0
+            nextRecorder.startRecording()
+            voiceLog("realtime_recording_started sampleRate=$REALTIME_SAMPLE_RATE bufferSize=$bufferSize")
+            emitNativeVoiceEvent("realtime_recording_started", mapOf("sampleRate" to REALTIME_SAMPLE_RATE))
+
+            realtimeCaptureThread = thread(start = true, name = "TravelBuddyRealtimeCapture") {
+                val buffer = ByteArray(bufferSize)
+                while (realtimeCapturing) {
+                    val read = nextRecorder.read(buffer, 0, buffer.size)
+                    if (read > 0) {
+                        val chunk = buffer.copyOf(read)
+                        realtimeAudioChunkCount += 1
+                        if (realtimeAudioChunkCount == 1 || realtimeAudioChunkCount % 50 == 0) {
+                            voiceLog("realtime_audio_chunk_captured count=$realtimeAudioChunkCount bytes=$read")
+                        }
+                        emitNativeVoiceEvent(
+                            "realtime_audio_chunk",
+                            mapOf(
+                                "audioBase64" to Base64.encodeToString(chunk, Base64.NO_WRAP),
+                                "bytes" to read,
+                                "sampleRate" to REALTIME_SAMPLE_RATE
+                            )
+                        )
+                    }
+                }
+            }
+
+            result.success(true)
+        } catch (error: Exception) {
+            realtimeCapturing = false
+            realtimeRecorder?.release()
+            realtimeRecorder = null
+            voiceLog("realtime_recording_start_failed:${error.message}")
+            result.error("REALTIME_RECORDING_START_FAILED", error.message, null)
+        }
+    }
+
+    private fun stopRealtimeAudioCapture(result: MethodChannel.Result) {
+        realtimeCapturing = false
+        try {
+            realtimeRecorder?.stop()
+        } catch (_: Exception) {
+        }
+        realtimeRecorder?.release()
+        realtimeRecorder = null
+        realtimeCaptureThread = null
+        voiceLog("realtime_recording_stopped chunks=$realtimeAudioChunkCount")
+        emitNativeVoiceEvent("realtime_recording_stopped", mapOf("chunks" to realtimeAudioChunkCount))
+        result.success(true)
+    }
+
+    private fun playRealtimeAudioChunk(audioBase64: String, result: MethodChannel.Result) {
+        if (audioBase64.isBlank()) {
+            result.success(false)
+            return
+        }
+
+        val audioBytes = Base64.decode(audioBase64, Base64.DEFAULT)
+        audioExecutor.execute {
+            try {
+                val track = ensureRealtimeAudioTrack()
+                if (!realtimePlaybackStarted) {
+                    realtimePlaybackStarted = true
+                    voiceLog("realtime_playback_started")
+                    emitNativeVoiceEvent("realtime_playback_started", emptyMap())
+                }
+                realtimePlaybackChunkCount += 1
+                if (realtimePlaybackChunkCount == 1 || realtimePlaybackChunkCount % 50 == 0) {
+                    voiceLog("realtime_ai_audio_chunk_played count=$realtimePlaybackChunkCount bytes=${audioBytes.size}")
+                }
+                track.write(audioBytes, 0, audioBytes.size)
+            } catch (error: Exception) {
+                voiceLog("realtime_playback_failed:${error.message}")
+                emitNativeVoiceEvent(
+                    "realtime_playback_error",
+                    mapOf("message" to (error.message ?: "Realtime playback failed."))
+                )
+            }
+        }
+        result.success(true)
+    }
+
+    private fun stopRealtimeAudioPlayback(result: MethodChannel.Result) {
+        audioExecutor.execute {
+            stopRealtimeAudioTrack()
+            voiceLog("realtime_playback_ended chunks=$realtimePlaybackChunkCount")
+            emitNativeVoiceEvent("realtime_playback_ended", mapOf("chunks" to realtimePlaybackChunkCount))
+        }
+        result.success(true)
+    }
+
+    private fun ensureRealtimeAudioTrack(): AudioTrack {
+        val existing = realtimeAudioTrack
+        if (existing != null) return existing
+
+        val minBuffer = AudioTrack.getMinBufferSize(
+            REALTIME_SAMPLE_RATE,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        val bufferSize = maxOf(minBuffer, REALTIME_SAMPLE_RATE / 2 * 2)
+        val track = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(REALTIME_SAMPLE_RATE)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            AudioTrack(
+                android.media.AudioManager.STREAM_MUSIC,
+                REALTIME_SAMPLE_RATE,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize,
+                AudioTrack.MODE_STREAM
+            )
+        }
+        track.play()
+        realtimePlaybackChunkCount = 0
+        realtimeAudioTrack = track
+        return track
+    }
+
+    private fun stopRealtimeAudioTrack() {
+        try {
+            realtimeAudioTrack?.pause()
+            realtimeAudioTrack?.flush()
+            realtimeAudioTrack?.stop()
+        } catch (_: Exception) {
+        }
+        realtimeAudioTrack?.release()
+        realtimeAudioTrack = null
+        realtimePlaybackStarted = false
     }
 
     private fun startVoiceRecording(result: MethodChannel.Result) {
@@ -259,6 +485,14 @@ class MainActivity : FlutterActivity() {
 
     private fun stopPlayback(result: MethodChannel.Result) {
         stopCurrentPlayer()
+        realtimeCapturing = false
+        try {
+            realtimeRecorder?.stop()
+        } catch (_: Exception) {
+        }
+        realtimeRecorder?.release()
+        realtimeRecorder = null
+        stopRealtimeAudioTrack()
         voiceLog("audio_playback_stopped")
         result.success(true)
     }
@@ -364,6 +598,26 @@ class MainActivity : FlutterActivity() {
 
     private fun voiceLog(message: String) {
         Log.i(logTag, message)
+    }
+
+    private fun emitNativeVoiceEvent(type: String, data: Map<String, Any?>) {
+        mainHandler.post {
+            nativeChannel.invokeMethod("nativeVoiceEvent", mapOf("type" to type, "data" to data))
+        }
+    }
+
+    override fun onDestroy() {
+        realtimeCapturing = false
+        try {
+            realtimeRecorder?.stop()
+        } catch (_: Exception) {
+        }
+        realtimeRecorder?.release()
+        realtimeRecorder = null
+        stopRealtimeAudioTrack()
+        textToSpeech?.shutdown()
+        audioExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun headerHex(bytes: ByteArray, count: Int = 16): String {

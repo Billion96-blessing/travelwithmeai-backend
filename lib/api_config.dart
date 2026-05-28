@@ -14,4 +14,10 @@ class ApiConfig {
     final cleanPath = path.startsWith('/') ? path : '/$path';
     return Uri.parse('$base$cleanPath');
   }
+
+  static Uri websocketEndpoint(String path) {
+    final endpointUri = endpoint(path);
+    final scheme = endpointUri.scheme == 'https' ? 'wss' : 'ws';
+    return endpointUri.replace(scheme: scheme);
+  }
 }
