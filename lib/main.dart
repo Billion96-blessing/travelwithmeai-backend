@@ -756,14 +756,19 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           realtimeRecovering = true;
           weakNetworkMode = true;
           trackEvent('realtime_error');
-          aiMessages.add(
-            ConversationLine(
-              title: 'Voice issue',
-              text: message,
-              translation:
-                  'Please try again in a quieter spot or check your mobile connection.',
-            ),
-          );
+          final alreadyShown = aiMessages.isNotEmpty &&
+              aiMessages.last.title == 'Voice issue' &&
+              aiMessages.last.text == message;
+          if (!alreadyShown) {
+            aiMessages.add(
+              ConversationLine(
+                title: 'Voice issue',
+                text: message,
+                translation:
+                    'Please try again in a quieter spot or check your mobile connection.',
+              ),
+            );
+          }
       }
     });
   }

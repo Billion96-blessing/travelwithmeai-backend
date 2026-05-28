@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -18,6 +19,8 @@ class RealtimeBridge {
   bool _muted = false;
   bool _recordingTurn = false;
   bool _busy = false;
+  Timer? _turnRecordingTimer;
+  Timer? _autoListenTimer;
   final List<Map<String, String>> _conversation = [];
 
   void start(String goal, RealtimeEventCallback onEvent) {
@@ -26,6 +29,8 @@ class RealtimeBridge {
     _active = true;
     _muted = false;
     _recordingTurn = false;
+    _turnRecordingTimer?.cancel();
+    _autoListenTimer?.cancel();
     _conversation.clear();
     _startVoiceSession(goal, onEvent);
   }
@@ -35,6 +40,8 @@ class RealtimeBridge {
     _muted = false;
     _busy = false;
     _recordingTurn = false;
+    _turnRecordingTimer?.cancel();
+    _autoListenTimer?.cancel();
     _client?.close(force: true);
     _client = null;
     _channel
@@ -55,10 +62,12 @@ class RealtimeBridge {
     _muted = muted;
     if (muted && _recordingTurn) {
       _recordingTurn = false;
+      _turnRecordingTimer?.cancel();
       _channel
           .invokeMethod<bool>('cancelVoiceRecording')
           .catchError((_) => false);
     }
+    if (muted) _autoListenTimer?.cancel();
     _emit(_lastCallback, 'status', {
       'message': muted ? 'Muted' : 'Listening',
     });
@@ -82,6 +91,7 @@ class RealtimeBridge {
     }
 
     if (_recordingTurn) {
+      _turnRecordingTimer?.cancel();
       _finishVoiceTurn(onEvent);
     } else {
       _startVoiceTurnRecording(onEvent);
@@ -165,6 +175,7 @@ class RealtimeBridge {
       await _sendAiTextReply(goal, onEvent);
     } finally {
       _busy = false;
+      _scheduleAutoListen(onEvent);
     }
   }
 
@@ -183,12 +194,18 @@ class RealtimeBridge {
           .timeout(const Duration(seconds: 6));
       _recordingTurn = true;
       _emit(onEvent, 'recording_started', {
-        'message': 'Recording started. Tap the mic again to send.',
+        'message': 'Listening. Speak now.',
       });
       _emit(onEvent, 'provider_speaking', {
         'message': 'Recording provider speech...',
       });
       _emit(onEvent, 'voice_log', {'message': 'recording started'});
+      _turnRecordingTimer?.cancel();
+      _turnRecordingTimer = Timer(const Duration(seconds: 7), () {
+        if (_active && !_muted && _recordingTurn && !_busy) {
+          _finishVoiceTurn(onEvent);
+        }
+      });
     } catch (error) {
       _recordingTurn = false;
       _emit(onEvent, 'error', {
@@ -203,6 +220,7 @@ class RealtimeBridge {
     try {
       _busy = true;
       _recordingTurn = false;
+      _turnRecordingTimer?.cancel();
       _emit(onEvent, 'recording_stopped', {
         'message': 'Recording stopped.',
       });
@@ -244,7 +262,17 @@ class RealtimeBridge {
       _emit(onEvent, 'voice_log', {'message': 'voice turn failed: $error'});
     } finally {
       _busy = false;
+      _scheduleAutoListen(onEvent);
     }
+  }
+
+  void _scheduleAutoListen(RealtimeEventCallback onEvent) {
+    _autoListenTimer?.cancel();
+    if (!_active || _muted || _recordingTurn || _busy) return;
+    _autoListenTimer = Timer(const Duration(milliseconds: 900), () {
+      if (!_active || _muted || _recordingTurn || _busy) return;
+      _startVoiceTurnRecording(onEvent);
+    });
   }
 
   Future<void> _startGoalRecording(RealtimeEventCallback onEvent) async {
@@ -553,6 +581,8 @@ class RealtimeBridge {
       await _channel.invokeMethod<bool>('playAudioBase64', {
         'audioBase64': audioBase64,
         'mimeType': mimeType,
+        'fallbackText':
+            _conversation.isNotEmpty ? _conversation.last['text'] ?? '' : '',
       }).timeout(const Duration(seconds: 70));
       _emit(onEvent, 'voice_log', {'message': 'audio playback completed'});
     } catch (error) {

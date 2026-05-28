@@ -5,11 +5,12 @@ import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.net.Uri
 import android.util.Base64
 import android.util.Log
 import androidx.core.app.ActivityCompat
@@ -18,6 +19,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.io.FileInputStream
+import java.util.Locale
 
 class MainActivity : FlutterActivity() {
     private val channelName = "travelbuddy_ai/native"
@@ -28,6 +31,7 @@ class MainActivity : FlutterActivity() {
     private var recordingFile: File? = null
     private var recordingStartedAt: Long = 0
     private var player: MediaPlayer? = null
+    private var textToSpeech: TextToSpeech? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -42,7 +46,8 @@ class MainActivity : FlutterActivity() {
                     "playAudioBase64" -> {
                         val audioBase64 = call.argument<String>("audioBase64") ?: ""
                         val mimeType = call.argument<String>("mimeType") ?: "audio/mpeg"
-                        playAudioBase64(audioBase64, mimeType, result)
+                        val fallbackText = call.argument<String>("fallbackText") ?: ""
+                        playAudioBase64(audioBase64, mimeType, fallbackText, result)
                     }
                     "stopPlayback" -> stopPlayback(result)
                     else -> result.notImplemented()
@@ -175,9 +180,9 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun playAudioBase64(audioBase64: String, mimeType: String, result: MethodChannel.Result) {
+    private fun playAudioBase64(audioBase64: String, mimeType: String, fallbackText: String, result: MethodChannel.Result) {
         if (audioBase64.isBlank()) {
-            result.error("EMPTY_AUDIO", "No audio to play.", null)
+            speakFallback(fallbackText, "EMPTY_AUDIO", "No audio to play.", result)
             return
         }
 
@@ -191,7 +196,7 @@ class MainActivity : FlutterActivity() {
             }
             val audioBytes = Base64.decode(audioBase64, Base64.DEFAULT)
             if (audioBytes.size < 512) {
-                result.error("PLAYBACK_AUDIO_TOO_SMALL", "Decoded audio is too small: ${audioBytes.size} bytes.", null)
+                speakFallback(fallbackText, "PLAYBACK_AUDIO_TOO_SMALL", "Decoded audio is too small: ${audioBytes.size} bytes.", result)
                 return
             }
 
@@ -220,7 +225,7 @@ class MainActivity : FlutterActivity() {
                     voiceLog("audio_playback_failed code=$code message=$message mime=$mimeType bytes=${audioBytes.size} header=${headerHex(audioBytes)}")
                     stopCurrentPlayer()
                     audioFile.delete()
-                    result.error(code, message, null)
+                    speakFallback(fallbackText, code, message, result)
                 }
             }
 
@@ -230,7 +235,9 @@ class MainActivity : FlutterActivity() {
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
-            nextPlayer.setDataSource(this, Uri.fromFile(audioFile))
+            FileInputStream(audioFile).use { stream ->
+                nextPlayer.setDataSource(stream.fd)
+            }
             nextPlayer.setOnPreparedListener {
                 voiceLog("audio_playback_started durationMs=${it.duration} mime=$mimeType bytes=${audioBytes.size}")
                 it.start()
@@ -246,7 +253,7 @@ class MainActivity : FlutterActivity() {
             nextPlayer.prepareAsync()
         } catch (error: Exception) {
             voiceLog("audio_playback_failed:${error.message}")
-            result.error("PLAYBACK_FAILED", error.message, null)
+            speakFallback(fallbackText, "PLAYBACK_FAILED", error.message, result)
         }
     }
 
@@ -265,6 +272,96 @@ class MainActivity : FlutterActivity() {
         player = null
     }
 
+    private fun speakFallback(
+        text: String,
+        originalCode: String,
+        originalMessage: String?,
+        result: MethodChannel.Result
+    ) {
+        val cleanText = text.trim()
+        if (cleanText.isBlank()) {
+            result.error(originalCode, originalMessage, null)
+            return
+        }
+
+        voiceLog("android_tts_fallback_start reason=$originalCode message=$originalMessage textLength=${cleanText.length}")
+        var completed = false
+
+        fun finishSuccess() {
+            if (completed) return
+            completed = true
+            mainHandler.post {
+                voiceLog("android_tts_fallback_ended")
+                result.success(true)
+            }
+        }
+
+        fun finishError(message: String?) {
+            if (completed) return
+            completed = true
+            mainHandler.post {
+                voiceLog("android_tts_fallback_failed:$message")
+                result.error(originalCode, "${originalMessage ?: "Playback failed"}; Android TTS fallback failed: $message", null)
+            }
+        }
+
+        mainHandler.post {
+            try {
+                textToSpeech?.shutdown()
+                textToSpeech = TextToSpeech(this) { status ->
+                    if (status != TextToSpeech.SUCCESS) {
+                        finishError("initialization failed")
+                        return@TextToSpeech
+                    }
+
+                    val engine = textToSpeech
+                    if (engine == null) {
+                        finishError("engine unavailable")
+                        return@TextToSpeech
+                    }
+
+                    engine.language = if (containsThai(cleanText)) Locale("th", "TH") else Locale.getDefault()
+                    engine.setSpeechRate(0.96f)
+                    engine.setPitch(1.0f)
+                    engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) {
+                            voiceLog("android_tts_fallback_speaking")
+                        }
+
+                        override fun onDone(utteranceId: String?) {
+                            engine.shutdown()
+                            textToSpeech = null
+                            finishSuccess()
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(utteranceId: String?) {
+                            engine.shutdown()
+                            textToSpeech = null
+                            finishError("speech error")
+                        }
+
+                        override fun onError(utteranceId: String?, errorCode: Int) {
+                            engine.shutdown()
+                            textToSpeech = null
+                            finishError("speech error $errorCode")
+                        }
+                    })
+
+                    val utteranceId = "travelbuddy_ai_${System.currentTimeMillis()}"
+                    val speakResult = engine.speak(cleanText, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+                    if (speakResult == TextToSpeech.ERROR) {
+                        engine.shutdown()
+                        textToSpeech = null
+                        finishError("speak returned error")
+                    }
+                }
+            } catch (error: Exception) {
+                finishError(error.message)
+            }
+        }
+    }
+
     private fun voiceLog(message: String) {
         Log.i(logTag, message)
     }
@@ -273,5 +370,9 @@ class MainActivity : FlutterActivity() {
         return bytes
             .take(count)
             .joinToString(" ") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    private fun containsThai(text: String): Boolean {
+        return text.any { it.code in 0x0E00..0x0E7F }
     }
 }
