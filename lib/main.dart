@@ -9,6 +9,11 @@ import 'api_config.dart';
 import 'auth_service.dart';
 import 'realtime_bridge.dart';
 
+const developerDebugMode = bool.fromEnvironment(
+  'DEVELOPER_DEBUG',
+  defaultValue: true,
+);
+
 void main() {
   runApp(const TravelNegotiatorApp());
 }
@@ -121,6 +126,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
   bool realtimeRecovering = false;
   bool weakNetworkMode = false;
   String statusMessage = 'Ready to start realtime negotiation.';
+  String debugStatusMessage = 'Diagnostics ready.';
   final realtimeBridge = RealtimeBridge();
   final authService = createAuthService();
   String liveAiTranscript = '';
@@ -349,7 +355,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
       realtimeRecovering = false;
       weakNetworkMode = false;
       approvalRequired = true;
-      statusMessage = 'Connecting to ${ApiConfig.backendBaseUrl}...';
+      statusMessage = 'Connecting...';
       liveAiTranscript = '';
       providerMessages
         ..clear()
@@ -456,6 +462,25 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
     });
   }
 
+  void testBackendConnection() {
+    trackEvent('debug_test_backend');
+    setState(() {
+      debugStatusMessage = 'Testing backend...';
+      statusMessage = 'Connecting...';
+    });
+    realtimeBridge.testBackend(handleRealtimeEvent);
+  }
+
+  void testAiTextReply() {
+    trackEvent('debug_test_ai_text');
+    setState(() {
+      debugStatusMessage = 'Testing AI text reply...';
+      statusMessage = 'AI Thinking';
+      voiceState = VoiceState.thinking;
+    });
+    realtimeBridge.testAiTextReply(handleRealtimeEvent);
+  }
+
   void approveDeal() {
     realtimeBridge.approve();
     trackEvent('deal_approved');
@@ -536,10 +561,26 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           realtimeReady = data['realtimeReady'] == true;
           statusMessage = backendConnected
               ? realtimeReady
-                  ? 'Cloud backend connected. Realtime ready.'
-                  : 'Cloud backend connected. Add OPENAI_API_KEY on Render.'
-              : 'Cloud backend disconnected.';
+                  ? 'Connected'
+                  : 'Connected'
+              : 'Offline';
           if (backendConnected) realtimeRecovering = false;
+        case 'fallback_mode':
+          statusMessage = 'Connected';
+          realtimeReady = false;
+          realtimeRecovering = false;
+          debugStatusMessage =
+              data['message']?.toString() ?? 'Using AI text fallback.';
+        case 'permission_denied':
+          statusMessage = data['message']?.toString() ?? 'Permission needed';
+          voiceState = VoiceState.ready;
+          microphonePermission = false;
+        case 'debug_result':
+          final name = data['name']?.toString() ?? 'Diagnostic';
+          final ok = data['ok'] == true;
+          final message = data['message']?.toString() ?? '';
+          debugStatusMessage = '${ok ? 'OK' : 'Failed'}: $name\n$message';
+          statusMessage = ok ? 'Connected' : 'Offline';
         case 'provider_transcript':
           final text = data['text']?.toString().trim();
           if (text != null && text.isNotEmpty) {
@@ -827,6 +868,9 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           onStop: stopNegotiation,
           onAccept: approveDeal,
           onReject: rejectDeal,
+          onTestBackend: testBackendConnection,
+          onTestAiText: testAiTextReply,
+          debugStatusMessage: debugStatusMessage,
         );
       case 2:
         return Column(
@@ -1695,6 +1739,9 @@ class _LiveConversationSection extends StatefulWidget {
     required this.onStop,
     required this.onAccept,
     required this.onReject,
+    required this.onTestBackend,
+    required this.onTestAiText,
+    required this.debugStatusMessage,
   });
 
   final VoiceState state;
@@ -1713,6 +1760,9 @@ class _LiveConversationSection extends StatefulWidget {
   final VoidCallback onStop;
   final VoidCallback onAccept;
   final VoidCallback onReject;
+  final VoidCallback onTestBackend;
+  final VoidCallback onTestAiText;
+  final String debugStatusMessage;
 
   @override
   State<_LiveConversationSection> createState() =>
@@ -1770,15 +1820,21 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
 
     final statusLabel = widget.micMuted
         ? 'Muted'
-        : widget.state == VoiceState.providerSpeaking
-            ? 'Provider Speaking'
-            : widget.state == VoiceState.speaking
-                ? 'AI Speaking'
-                : widget.state == VoiceState.thinking
-                    ? 'AI Thinking'
-                    : widget.state == VoiceState.listening
-                        ? 'Listening'
-                        : 'Waiting';
+        : !widget.microphonePermission
+            ? 'Permission needed'
+            : widget.recovering
+                ? 'Reconnecting'
+                : !widget.backendConnected
+                    ? 'Connecting'
+                    : widget.state == VoiceState.providerSpeaking
+                        ? 'Provider Speaking'
+                        : widget.state == VoiceState.speaking
+                            ? 'AI Speaking'
+                            : widget.state == VoiceState.thinking
+                                ? 'AI Thinking'
+                                : widget.state == VoiceState.listening
+                                    ? 'Listening'
+                                    : 'Waiting';
 
     return Container(
       clipBehavior: Clip.antiAlias,
@@ -1857,7 +1913,6 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
                   connected: widget.backendConnected,
                   microphonePermission: widget.microphonePermission,
                   realtimeReady: widget.realtimeReady,
-                  backendBaseUrl: widget.backendBaseUrl,
                 ),
                 if (widget.recovering || widget.weakNetworkMode) ...[
                   const SizedBox(height: 10),
@@ -1883,6 +1938,24 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
                 ),
                 const SizedBox(height: 12),
                 _ReferenceWaveCard(state: widget.state, muted: widget.micMuted),
+                const SizedBox(height: 12),
+                _BigLiveMicButton(
+                  permissionGranted: widget.microphonePermission,
+                  muted: widget.micMuted,
+                  listening: widget.state == VoiceState.listening ||
+                      widget.state == VoiceState.providerSpeaking,
+                  onPressed: widget.microphonePermission
+                      ? widget.onMuteToggle
+                      : widget.onMic,
+                ),
+                if (developerDebugMode) ...[
+                  const SizedBox(height: 12),
+                  _LiveDebugPanel(
+                    message: widget.debugStatusMessage,
+                    onTestBackend: widget.onTestBackend,
+                    onTestAiText: widget.onTestAiText,
+                  ),
+                ],
                 const SizedBox(height: 18),
               ],
             ),
@@ -2003,13 +2076,11 @@ class _BackendStatusStrip extends StatelessWidget {
     required this.connected,
     required this.microphonePermission,
     required this.realtimeReady,
-    required this.backendBaseUrl,
   });
 
   final bool connected;
   final bool microphonePermission;
   final bool realtimeReady;
-  final String backendBaseUrl;
 
   @override
   Widget build(BuildContext context) {
@@ -2041,7 +2112,7 @@ class _BackendStatusStrip extends StatelessWidget {
             runSpacing: 8,
             children: [
               _TinyStatusChip(
-                label: connected ? 'Connected' : 'Disconnected',
+                label: connected ? 'Connected' : 'Offline',
                 active: connected,
                 icon: connected ? Icons.cloud_done : Icons.cloud_off,
               ),
@@ -2053,22 +2124,15 @@ class _BackendStatusStrip extends StatelessWidget {
                 icon: microphonePermission ? Icons.mic : Icons.mic_none,
               ),
               _TinyStatusChip(
-                label: realtimeReady ? 'Realtime ready' : 'Realtime pending',
+                label: realtimeReady
+                    ? 'Voice ready'
+                    : connected
+                        ? 'AI text ready'
+                        : 'Connecting',
                 active: realtimeReady,
                 icon: Icons.graphic_eq_rounded,
               ),
             ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            backendBaseUrl,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: colorScheme.onSurfaceVariant,
-              fontSize: 11,
-              fontWeight: FontWeight.w700,
-            ),
           ),
         ],
       ),
@@ -2161,6 +2225,149 @@ class _RecoveryBanner extends StatelessWidget {
                 height: 1.25,
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BigLiveMicButton extends StatelessWidget {
+  const _BigLiveMicButton({
+    required this.permissionGranted,
+    required this.muted,
+    required this.listening,
+    required this.onPressed,
+  });
+
+  final bool permissionGranted;
+  final bool muted;
+  final bool listening;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final label = !permissionGranted
+        ? 'Tap to allow microphone'
+        : muted
+            ? 'Tap to unmute'
+            : listening
+                ? 'Listening'
+                : 'Tap to start listening';
+    final icon = !permissionGranted || muted ? Icons.mic_off : Icons.mic;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 240),
+      width: double.infinity,
+      height: 68,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            colorScheme.primary,
+            colorScheme.secondary,
+          ],
+        ),
+        borderRadius: BorderRadius.circular(22),
+        boxShadow: [
+          BoxShadow(
+            color: colorScheme.primary.withValues(alpha: 0.26),
+            blurRadius: 24,
+            offset: const Offset(0, 12),
+          ),
+        ],
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(22),
+          onTap: onPressed,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: colorScheme.onPrimary, size: 25),
+              const SizedBox(width: 10),
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: colorScheme.onPrimary,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LiveDebugPanel extends StatelessWidget {
+  const _LiveDebugPanel({
+    required this.message,
+    required this.onTestBackend,
+    required this.onTestAiText,
+  });
+
+  final String message;
+  final VoidCallback onTestBackend;
+  final VoidCallback onTestAiText;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.52),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Beta diagnostics',
+            style: TextStyle(
+              color: colorScheme.onSurface,
+              fontWeight: FontWeight.w900,
+              fontSize: 13,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            message,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: colorScheme.onSurfaceVariant,
+              fontSize: 12,
+              height: 1.28,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: onTestBackend,
+                  child: const Text('Test Backend'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton(
+                  onPressed: onTestAiText,
+                  child: const Text('Test AI Reply'),
+                ),
+              ),
+            ],
           ),
         ],
       ),

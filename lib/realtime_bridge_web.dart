@@ -3,7 +3,8 @@ import 'dart:js_interop';
 typedef RealtimeEventCallback = void Function(String rawEvent);
 
 @JS('startFlutterRealtimeNegotiator')
-external void startFlutterRealtimeNegotiator(JSString goal, JSExportedDartFunction onEvent);
+external void startFlutterRealtimeNegotiator(
+    JSString goal, JSExportedDartFunction onEvent);
 
 @JS('stopFlutterRealtimeNegotiator')
 external void stopFlutterRealtimeNegotiator();
@@ -54,5 +55,17 @@ class RealtimeBridge {
 
   void stopGoalSpeech() {
     stopFlutterGoalSpeech();
+  }
+
+  void testBackend(RealtimeEventCallback onEvent) {
+    onEvent(
+      '{"type":"debug_result","name":"Backend health","ok":true,"message":"Use the Android app for native backend diagnostics. Chrome realtime uses the web bridge."}',
+    );
+  }
+
+  void testAiTextReply(RealtimeEventCallback onEvent) {
+    onEvent(
+      '{"type":"debug_result","name":"AI text reply","ok":true,"message":"Use the Android app for native AI text diagnostics. Chrome realtime uses the web bridge."}',
+    );
   }
 }
