@@ -1,4 +1,4 @@
-package com.example.voice_negotiator
+package com.travelwithmeai.app
 
 import io.flutter.embedding.android.FlutterActivity
 

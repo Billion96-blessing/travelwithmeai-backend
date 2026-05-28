@@ -1,7 +1,7 @@
 name: voice_negotiator
 description: Real-time AI Negotiator Mode using Flutter, Node.js, and OpenAI Realtime API.
 publish_to: "none"
-version: 1.0.0+1
+version: 1.0.0+2
 
 environment:
   sdk: ">=3.4.0 <4.0.0"

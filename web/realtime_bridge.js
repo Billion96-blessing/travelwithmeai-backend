@@ -9,8 +9,15 @@
   let providerLanguage = "Thai";
   let goalRecognition = null;
   let goalSpeechActive = false;
+  let manualStop = false;
+  let activeGoal = "";
+  let activeOnEvent = null;
+  let reconnectAttempts = 0;
+  let reconnectTimer = null;
   const defaultBackendBaseUrl = "https://travelwithmeai-server.onrender.com";
   const customDomainBackendBaseUrl = "https://api.travelwithmeai.com";
+  const requestTimeoutMs = 15000;
+  const maxReconnectAttempts = 1;
 
   function backendBaseUrl() {
     const configured =
@@ -28,6 +35,77 @@
     if (emitToFlutter) {
       emitToFlutter(JSON.stringify({ type, ...payload }));
     }
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function fetchWithTimeout(url, options = {}, timeoutMs = requestTimeoutMs) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function fetchJsonWithRetry(url, options = {}, retries = 2) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        const response = await fetchWithTimeout(url, options);
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok && attempt < retries && (response.status === 429 || response.status >= 500)) {
+          await sleep(300 * (attempt + 1));
+          continue;
+        }
+
+        return { response, data };
+      } catch (error) {
+        lastError = error;
+        if (attempt >= retries) break;
+        await sleep(300 * (attempt + 1));
+      }
+    }
+
+    throw lastError || new Error("Network request failed.");
+  }
+
+  async function requestMicrophoneStream() {
+    if (navigator.permissions?.query) {
+      let permission = null;
+      try {
+        permission = await navigator.permissions.query({ name: "microphone" });
+      } catch {
+        // Some browsers do not expose microphone permission state. getUserMedia will show the prompt.
+      }
+      if (permission?.state === "denied") {
+        throw new Error("Microphone permission is blocked. Enable it in browser settings and try again.");
+      }
+    }
+
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+  }
+
+  function scheduleReconnect() {
+    if (manualStop || reconnectAttempts >= maxReconnectAttempts || !activeGoal || !activeOnEvent) return;
+
+    reconnectAttempts += 1;
+    clearTimeout(reconnectTimer);
+    emit("status", { message: "Disconnected. Reconnecting..." });
+    reconnectTimer = setTimeout(() => {
+      window.startFlutterRealtimeNegotiator(activeGoal, activeOnEvent, { isReconnect: true });
+    }, 900);
   }
 
   function parseTargetLanguage(goal) {
@@ -86,16 +164,15 @@
     const cleanText = String(text || "").trim();
     if (!cleanText) return "";
 
-    const response = await fetch(backendUrl("/api/translate"), {
+    const { response, data } = await fetchJsonWithRetry(backendUrl("/api/translate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text: cleanText,
         targetLanguage: language || "English"
       })
-    });
+    }, 1);
 
-    const data = await response.json();
     if (!response.ok) {
       throw new Error(data.error || "Translation failed.");
     }
@@ -111,6 +188,10 @@
   }
 
   window.stopFlutterRealtimeNegotiator = function () {
+    manualStop = true;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+
     if (dataChannel) {
       dataChannel.close();
       dataChannel = null;
@@ -160,8 +241,12 @@
     emit("approved", { message: `Approved. AI is confirming in ${providerLanguage}.` });
   };
 
-  window.startFlutterRealtimeNegotiator = async function (goal, onEvent) {
+  window.startFlutterRealtimeNegotiator = async function (goal, onEvent, options = {}) {
     emitToFlutter = onEvent;
+    activeGoal = goal;
+    activeOnEvent = onEvent;
+    manualStop = false;
+    if (!options.isReconnect) reconnectAttempts = 0;
     aiTurnTranscript = "";
     targetLanguage = parseTargetLanguage(goal);
     providerLanguage = parseProviderLanguage(goal);
@@ -172,6 +257,7 @@
       }
 
       window.stopFlutterRealtimeNegotiator();
+      manualStop = false;
       emitToFlutter = onEvent;
       emit("status", { message: "Requesting microphone permission..." });
 
@@ -183,13 +269,12 @@
         customDomainReady: customDomainBackendBaseUrl
       });
 
-      const tokenResponse = await fetch(backendUrl("/api/realtime-token"), {
+      const { response: tokenResponse, data: tokenData } = await fetchJsonWithRetry(backendUrl("/api/realtime-token"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode: "negotiator", goal })
-      });
+      }, 2);
 
-      const tokenData = await tokenResponse.json();
       if (!tokenResponse.ok) {
         throw new Error(tokenData.error || "Could not create realtime session.");
       }
@@ -219,7 +304,8 @@
       peerConnection.addEventListener("connectionstatechange", () => {
         const state = peerConnection ? peerConnection.connectionState : "closed";
         if (state === "connected") emit("status", { message: "Listening" });
-        if (["failed", "disconnected", "closed"].includes(state)) emit("status", { message: "Disconnected" });
+        if (["failed", "disconnected"].includes(state)) scheduleReconnect();
+        if (state === "closed" && !manualStop) emit("status", { message: "Disconnected" });
       });
 
       peerConnection.addEventListener("track", (event) => {
@@ -284,13 +370,7 @@
         }
       });
 
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
+      micStream = await requestMicrophoneStream();
       emit("backend_status", {
         connected: true,
         microphonePermission: true,
@@ -303,7 +383,7 @@
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
 
-      const sdpResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
+      const sdpResponse = await fetchWithTimeout("https://api.openai.com/v1/realtime/calls", {
         method: "POST",
         body: offer.sdp,
         headers: {
