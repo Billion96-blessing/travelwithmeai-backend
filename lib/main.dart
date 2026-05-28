@@ -758,10 +758,10 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           trackEvent('realtime_error');
           aiMessages.add(
             ConversationLine(
-              title: 'Connection issue',
+              title: 'Voice issue',
               text: message,
               translation:
-                  'Check Render deployment, then set OPENAI_API_KEY only in the backend environment.',
+                  'Please try again in a quieter spot or check your mobile connection.',
             ),
           );
       }

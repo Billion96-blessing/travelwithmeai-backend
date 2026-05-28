@@ -159,8 +159,7 @@ class RealtimeBridge {
       _emit(onEvent, 'status', {'message': 'Listening'});
     } catch (error) {
       _emit(onEvent, 'error', {
-        'message':
-            'Voice startup failed. Backend text fallback is available, but voice needs attention.',
+        'message': 'Voice startup had a problem. Please try again.',
       });
       _emit(onEvent, 'voice_log', {'message': 'voice startup failed: $error'});
       await _sendAiTextReply(goal, onEvent);
@@ -213,12 +212,18 @@ class RealtimeBridge {
       final audioBase64 = result?['audioBase64']?.toString() ?? '';
       final mimeType = result?['mimeType']?.toString() ?? 'audio/mp4';
       final bytes = result?['bytes']?.toString() ?? '0';
+      final durationMs = result?['durationMs']?.toString() ?? '0';
+      final headerHex = result?['headerHex']?.toString() ?? '';
       _emit(onEvent, 'audio_sent', {
-        'message': 'Audio sent to backend.',
+        'message': 'Audio sent. AI is listening.',
         'bytes': bytes,
+        'durationMs': durationMs,
       });
       _emit(onEvent, 'status', {'message': 'AI Thinking'});
-      _emit(onEvent, 'voice_log', {'message': 'audio sent: $bytes bytes'});
+      _emit(onEvent, 'voice_log', {
+        'message':
+            'recorded audio bytes=$bytes durationMs=$durationMs mime=$mimeType header=$headerHex',
+      });
 
       final data = await _postJson(
           '/api/voice-turn',
@@ -234,7 +239,7 @@ class RealtimeBridge {
       _emit(onEvent, 'status', {'message': 'Listening'});
     } catch (error) {
       _emit(onEvent, 'error', {
-        'message': 'Voice turn failed. Please try recording again.',
+        'message': 'I could not process that voice turn. Please try again.',
       });
       _emit(onEvent, 'voice_log', {'message': 'voice turn failed: $error'});
     } finally {
@@ -411,7 +416,7 @@ class RealtimeBridge {
       _emit(onEvent, 'ai_translation', {
         'text': reply,
         'translation':
-            'Text fallback only. Voice mode is the main Android path.',
+            'Voice is reconnecting. You can continue with this text reply.',
       });
       _emit(onEvent, 'ai_turn_done', {'text': reply});
       _emit(onEvent, 'status', {'message': 'Connected'});
@@ -459,6 +464,10 @@ class RealtimeBridge {
       );
     }
 
+    _emit(_lastCallback, 'voice_log', {
+      'message':
+          'upload success path=$path status=${response.statusCode} responseBytes=${body.length}',
+    });
     return data;
   }
 
@@ -473,6 +482,8 @@ class RealtimeBridge {
     final aiTranslation = data['aiTranslation']?.toString().trim() ?? '';
     final audioBase64 = data['audioBase64']?.toString() ?? '';
     final audioMimeType = data['audioMimeType']?.toString() ?? 'audio/mpeg';
+    final audioByteLength = data['audioByteLength']?.toString() ?? '';
+    final audioHeaderHex = data['audioHeaderHex']?.toString() ?? '';
 
     if (providerWasSpoken && providerTranscript.isNotEmpty) {
       _conversation.add({
@@ -511,6 +522,10 @@ class RealtimeBridge {
     }
 
     if (audioBase64.isNotEmpty) {
+      _emit(onEvent, 'voice_log', {
+        'message':
+            'AI audio received mime=$audioMimeType bytes=$audioByteLength header=$audioHeaderHex base64Length=${audioBase64.length}',
+      });
       _emit(onEvent, 'audio_playback_started', {
         'message': 'AI voice playback started.',
       });
@@ -520,7 +535,7 @@ class RealtimeBridge {
       });
     } else {
       _emit(onEvent, 'error', {
-        'message': 'AI text arrived, but no voice audio was returned.',
+        'message': 'AI answered with text, but voice audio was not returned.',
       });
     }
 
@@ -542,7 +557,7 @@ class RealtimeBridge {
       _emit(onEvent, 'voice_log', {'message': 'audio playback completed'});
     } catch (error) {
       _emit(onEvent, 'error', {
-        'message': 'AI voice could not play on Android speaker.',
+        'message': 'Voice playback had a problem. Please try again.',
       });
       _emit(onEvent, 'voice_log', {'message': 'playback failed: $error'});
     }

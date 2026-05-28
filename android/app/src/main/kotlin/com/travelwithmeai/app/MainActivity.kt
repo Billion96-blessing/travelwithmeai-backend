@@ -2,10 +2,14 @@ package com.travelwithmeai.app
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.MediaRecorder
-import android.os.Bundle
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.net.Uri
 import android.util.Base64
 import android.util.Log
 import androidx.core.app.ActivityCompat
@@ -24,6 +28,7 @@ class MainActivity : FlutterActivity() {
     private var recordingFile: File? = null
     private var recordingStartedAt: Long = 0
     private var player: MediaPlayer? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -136,13 +141,14 @@ class MainActivity : FlutterActivity() {
             val bytes = file.readBytes()
             val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
             file.delete()
-            voiceLog("recording_stopped:${durationMs}ms:${bytes.size}bytes")
+            voiceLog("recording_stopped durationMs=$durationMs bytes=${bytes.size} header=${headerHex(bytes)}")
             result.success(
                 mapOf(
                     "audioBase64" to encoded,
                     "mimeType" to "audio/mp4",
                     "durationMs" to durationMs,
-                    "bytes" to bytes.size
+                    "bytes" to bytes.size,
+                    "headerHex" to headerHex(bytes)
                 )
             )
         } catch (error: Exception) {
@@ -180,10 +186,18 @@ class MainActivity : FlutterActivity() {
             val extension = when {
                 mimeType.contains("wav", ignoreCase = true) -> "wav"
                 mimeType.contains("aac", ignoreCase = true) -> "aac"
+                mimeType.contains("mp4", ignoreCase = true) -> "m4a"
                 else -> "mp3"
             }
+            val audioBytes = Base64.decode(audioBase64, Base64.DEFAULT)
+            if (audioBytes.size < 512) {
+                result.error("PLAYBACK_AUDIO_TOO_SMALL", "Decoded audio is too small: ${audioBytes.size} bytes.", null)
+                return
+            }
+
             val audioFile = File(cacheDir, "travelbuddy_ai_reply_${System.currentTimeMillis()}.$extension")
-            audioFile.writeBytes(Base64.decode(audioBase64, Base64.DEFAULT))
+            audioFile.writeBytes(audioBytes)
+            voiceLog("audio_received_for_playback mime=$mimeType bytes=${audioBytes.size} header=${headerHex(audioBytes)}")
 
             val nextPlayer = MediaPlayer()
             var completed = false
@@ -191,24 +205,34 @@ class MainActivity : FlutterActivity() {
             fun finishSuccess() {
                 if (completed) return
                 completed = true
-                voiceLog("audio_playback_ended")
-                stopCurrentPlayer()
-                audioFile.delete()
-                result.success(true)
+                mainHandler.post {
+                    voiceLog("audio_playback_ended")
+                    stopCurrentPlayer()
+                    audioFile.delete()
+                    result.success(true)
+                }
             }
 
             fun finishError(code: String, message: String?) {
                 if (completed) return
                 completed = true
-                voiceLog("audio_playback_failed:$message")
-                stopCurrentPlayer()
-                audioFile.delete()
-                result.error(code, message, null)
+                mainHandler.post {
+                    voiceLog("audio_playback_failed code=$code message=$message mime=$mimeType bytes=${audioBytes.size} header=${headerHex(audioBytes)}")
+                    stopCurrentPlayer()
+                    audioFile.delete()
+                    result.error(code, message, null)
+                }
             }
 
-            nextPlayer.setDataSource(audioFile.absolutePath)
+            nextPlayer.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            nextPlayer.setDataSource(this, Uri.fromFile(audioFile))
             nextPlayer.setOnPreparedListener {
-                voiceLog("audio_playback_started")
+                voiceLog("audio_playback_started durationMs=${it.duration} mime=$mimeType bytes=${audioBytes.size}")
                 it.start()
             }
             nextPlayer.setOnCompletionListener {
@@ -243,5 +267,11 @@ class MainActivity : FlutterActivity() {
 
     private fun voiceLog(message: String) {
         Log.i(logTag, message)
+    }
+
+    private fun headerHex(bytes: ByteArray, count: Int = 16): String {
+        return bytes
+            .take(count)
+            .joinToString(" ") { "%02x".format(it.toInt() and 0xff) }
     }
 }
