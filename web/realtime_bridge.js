@@ -18,6 +18,21 @@
   const customDomainBackendBaseUrl = "https://api.travelwithmeai.com";
   const requestTimeoutMs = 15000;
   const maxReconnectAttempts = 1;
+  const analyticsKey = "travelbuddy_beta_events";
+
+  function trackEvent(name, details = {}) {
+    try {
+      const current = JSON.parse(localStorage.getItem(analyticsKey) || "[]");
+      current.push({
+        name,
+        at: new Date().toISOString(),
+        ...details
+      });
+      localStorage.setItem(analyticsKey, JSON.stringify(current.slice(-80)));
+    } catch {
+      // Analytics hooks must never affect realtime voice.
+    }
+  }
 
   function backendBaseUrl() {
     const configured =
@@ -102,11 +117,49 @@
 
     reconnectAttempts += 1;
     clearTimeout(reconnectTimer);
+    trackEvent("realtime_reconnect_scheduled", { attempt: reconnectAttempts });
     emit("status", { message: "Disconnected. Reconnecting..." });
     reconnectTimer = setTimeout(() => {
       window.startFlutterRealtimeNegotiator(activeGoal, activeOnEvent, { isReconnect: true });
     }, 900);
   }
+
+  function setMicrophoneEnabled(enabled) {
+    if (!micStream) return;
+    micStream.getAudioTracks().forEach((track) => {
+      track.enabled = enabled;
+    });
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!activeGoal || manualStop) return;
+    if (document.hidden) {
+      setMicrophoneEnabled(false);
+      trackEvent("app_backgrounded_realtime");
+      emit("status", { message: "Backgrounded. Mic paused to save battery." });
+      return;
+    }
+
+    trackEvent("app_foregrounded_realtime");
+    setMicrophoneEnabled(true);
+    if (!peerConnection || ["failed", "disconnected", "closed"].includes(peerConnection.connectionState)) {
+      scheduleReconnect();
+    } else {
+      emit("status", { message: "Listening" });
+    }
+  });
+
+  window.addEventListener("online", () => {
+    if (!activeGoal || manualStop) return;
+    trackEvent("network_online_realtime");
+    scheduleReconnect();
+  });
+
+  window.addEventListener("offline", () => {
+    if (!activeGoal || manualStop) return;
+    trackEvent("network_offline_realtime");
+    emit("status", { message: "Weak network. Waiting to reconnect..." });
+  });
 
   function parseTargetLanguage(goal) {
     const match = String(goal || "").match(/User translation language:\s*([^\n]+)/i);
@@ -140,6 +193,8 @@
       "After the first message, negotiate on behalf of the user.",
       "Talk like a normal helpful person, not like a robot or formal assistant.",
       "Keep every turn very short, polite, direct, and natural.",
+      "Use natural pacing and adapt emotional tone to the provider: warm, calm, and confident.",
+      "Handle interruptions naturally. If the provider interrupts, stop and listen.",
       "Use short questions: Can you reduce a little? Is that the final price? What is included? Pickup included? Any extra fee?",
       "Use direct counteroffers like: Can you do 1500?",
       "If the deal sounds ready, say: Okay, let me ask my friend first.",
@@ -279,6 +334,7 @@
       if (!tokenResponse.ok) {
         throw new Error(tokenData.error || "Could not create realtime session.");
       }
+      trackEvent(options.isReconnect ? "realtime_reconnected" : "realtime_started");
 
       emit("backend_status", {
         connected: true,
@@ -295,6 +351,7 @@
 
       peerConnection = new RTCPeerConnection();
       dataChannel = peerConnection.createDataChannel("oai-events");
+      dataChannel.bufferedAmountLowThreshold = 16 * 1024;
       audioEl = document.getElementById("realtime-audio-output") || document.createElement("audio");
       audioEl.id = "realtime-audio-output";
       audioEl.autoplay = true;
@@ -315,6 +372,7 @@
 
       dataChannel.addEventListener("open", () => {
         emit("status", { message: "AI" });
+        trackEvent("realtime_data_channel_open");
         dataChannel.send(JSON.stringify({
           type: "response.create",
           response: {
@@ -338,6 +396,9 @@
         }
 
         if (data.type === "input_audio_buffer.speech_started") {
+          if (dataChannel && dataChannel.readyState === "open") {
+            dataChannel.send(JSON.stringify({ type: "response.cancel" }));
+          }
           emit("provider_speaking", { message: "Provider speaking..." });
         }
 

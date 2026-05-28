@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
 
@@ -94,7 +95,8 @@ class NegotiatorDashboard extends StatefulWidget {
   State<NegotiatorDashboard> createState() => _NegotiatorDashboardState();
 }
 
-class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
+class _NegotiatorDashboardState extends State<NegotiatorDashboard>
+    with WidgetsBindingObserver {
   final destination = TextEditingController(text: 'Coral Island');
   final activity = TextEditingController(
       text: 'Private boat transfer and 2-hour island visit');
@@ -116,13 +118,20 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
   bool backendConnected = false;
   bool microphonePermission = false;
   bool realtimeReady = false;
+  bool realtimeRecovering = false;
+  bool weakNetworkMode = false;
   String statusMessage = 'Ready to start realtime negotiation.';
   final realtimeBridge = RealtimeBridge();
   final authService = createAuthService();
   String liveAiTranscript = '';
+  String lastPrivateGoal = '';
+  DateTime lastRealtimeEventAt = DateTime.now();
+  Timer? realtimeWatchdog;
   int selectedTab = 0;
 
   static const tripNotesStorageKey = 'trip_notes';
+  static const liveSnapshotStorageKey = 'live_conversation_snapshot';
+  static const analyticsStorageKey = 'analytics_events';
 
   final providerMessages = <ConversationLine>[
     const ConversationLine(
@@ -167,7 +176,37 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     loadTripNotes();
+    loadLiveSnapshot();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      if (selectedTab == 1) {
+        realtimeBridge.setMuted(true);
+        micMuted = true;
+        trackEvent('app_backgrounded_live_session');
+        saveLiveSnapshot();
+      }
+      return;
+    }
+
+    if (state == AppLifecycleState.resumed && selectedTab == 1) {
+      trackEvent('app_resumed_live_session');
+      if (lastPrivateGoal.isNotEmpty && !backendConnected) {
+        resumeNegotiation();
+      } else if (micMuted) {
+        realtimeBridge.setMuted(false);
+        setState(() {
+          micMuted = false;
+          voiceState = VoiceState.listening;
+          statusMessage = 'Back online. Listening again.';
+        });
+      }
+    }
   }
 
   Future<void> loadTripNotes() async {
@@ -194,6 +233,66 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
       tripNotesStorageKey,
       tripNotes.map((note) => jsonEncode(note.toJson())).toList(),
     );
+  }
+
+  Future<void> loadLiveSnapshot() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(liveSnapshotStorageKey);
+    if (raw == null || raw.isEmpty) return;
+
+    try {
+      final data = jsonDecode(raw) as Map<String, dynamic>;
+      final provider = (data['providerMessages'] as List<dynamic>? ?? [])
+          .whereType<Map<String, dynamic>>()
+          .map(ConversationLine.fromJson)
+          .toList();
+      final ai = (data['aiMessages'] as List<dynamic>? ?? [])
+          .whereType<Map<String, dynamic>>()
+          .map(ConversationLine.fromJson)
+          .toList();
+      if (!mounted || (provider.isEmpty && ai.isEmpty)) return;
+      setState(() {
+        providerMessages
+          ..clear()
+          ..addAll(provider);
+        aiMessages
+          ..clear()
+          ..addAll(ai);
+        lastPrivateGoal = data['goal']?.toString() ?? '';
+      });
+    } catch (_) {
+      await prefs.remove(liveSnapshotStorageKey);
+    }
+  }
+
+  Future<void> saveLiveSnapshot() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      liveSnapshotStorageKey,
+      jsonEncode({
+        'goal': lastPrivateGoal,
+        'providerMessages':
+            providerMessages.take(30).map((line) => line.toJson()).toList(),
+        'aiMessages': aiMessages.take(30).map((line) => line.toJson()).toList(),
+      }),
+    );
+  }
+
+  Future<void> trackEvent(String name,
+      [Map<String, Object?> data = const {}]) async {
+    final prefs = await SharedPreferences.getInstance();
+    final current = prefs.getStringList(analyticsStorageKey) ?? const [];
+    final next = [
+      ...current.take(60),
+      jsonEncode({
+        'name': name,
+        'at': DateTime.now().toIso8601String(),
+        'live': selectedTab == 1,
+        'voiceState': voiceState.name,
+        ...data,
+      }),
+    ];
+    await prefs.setStringList(analyticsStorageKey, next);
   }
 
   void fillVoiceGoal() {
@@ -236,6 +335,10 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
 
   void startNegotiation() {
     final goal = buildPrivateGoal();
+    lastPrivateGoal = goal;
+    lastRealtimeEventAt = DateTime.now();
+    startRealtimeWatchdog();
+    trackEvent('live_start');
     setState(() {
       voiceState = VoiceState.thinking;
       selectedTab = 1;
@@ -243,6 +346,8 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
       backendConnected = false;
       microphonePermission = false;
       realtimeReady = false;
+      realtimeRecovering = false;
+      weakNetworkMode = false;
       approvalRequired = true;
       statusMessage = 'Connecting to ${ApiConfig.backendBaseUrl}...';
       liveAiTranscript = '';
@@ -271,6 +376,53 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
     realtimeBridge.start(goal, handleRealtimeEvent);
   }
 
+  void resumeNegotiation() {
+    if (lastPrivateGoal.isEmpty) return;
+    lastRealtimeEventAt = DateTime.now();
+    startRealtimeWatchdog();
+    trackEvent('live_resume');
+    setState(() {
+      selectedTab = 1;
+      realtimeRecovering = true;
+      weakNetworkMode = true;
+      voiceState = VoiceState.thinking;
+      statusMessage = 'Recovering realtime session...';
+    });
+    realtimeBridge.start(lastPrivateGoal, handleRealtimeEvent);
+  }
+
+  void startRealtimeWatchdog() {
+    realtimeWatchdog?.cancel();
+    realtimeWatchdog = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (!mounted || selectedTab != 1 || lastPrivateGoal.isEmpty) return;
+      final staleFor = DateTime.now().difference(lastRealtimeEventAt);
+      final activeTurn = voiceState == VoiceState.thinking ||
+          voiceState == VoiceState.providerSpeaking ||
+          voiceState == VoiceState.speaking;
+
+      if (staleFor.inSeconds >= 24 && activeTurn && !realtimeRecovering) {
+        trackEvent('live_timeout_recovery', {'seconds': staleFor.inSeconds});
+        setState(() {
+          weakNetworkMode = true;
+          realtimeRecovering = true;
+          statusMessage = 'Weak network. Reconnecting smoothly...';
+          aiMessages.add(
+            const ConversationLine(
+              title: 'Recovery',
+              text: 'Reconnecting...',
+              translation:
+                  'Keeping the conversation ready while signal recovers.',
+            ),
+          );
+        });
+        realtimeBridge.stop();
+        Future<void>.delayed(const Duration(milliseconds: 900), () {
+          if (mounted && realtimeRecovering) resumeNegotiation();
+        });
+      }
+    });
+  }
+
   void pauseNegotiation() {
     realtimeBridge.setMuted(true);
     setState(() {
@@ -293,15 +445,20 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
 
   void stopNegotiation() {
     realtimeBridge.stop();
+    realtimeWatchdog?.cancel();
+    trackEvent('live_stop');
     setState(() {
       voiceState = VoiceState.ready;
       micMuted = false;
+      realtimeRecovering = false;
+      weakNetworkMode = false;
       statusMessage = 'Realtime negotiation stopped.';
     });
   }
 
   void approveDeal() {
     realtimeBridge.approve();
+    trackEvent('deal_approved');
     setState(() {
       approvalRequired = false;
       voiceState = VoiceState.speaking;
@@ -333,6 +490,8 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
 
   void rejectDeal() {
     realtimeBridge.stop();
+    realtimeWatchdog?.cancel();
+    trackEvent('deal_rejected');
     setState(() {
       approvalRequired = false;
       voiceState = VoiceState.ready;
@@ -347,7 +506,15 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
   }
 
   void handleRealtimeEvent(String rawEvent) {
-    final data = jsonDecode(rawEvent) as Map<String, dynamic>;
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(rawEvent) as Map<String, dynamic>;
+    } catch (_) {
+      trackEvent('realtime_event_parse_failed');
+      return;
+    }
+
+    lastRealtimeEventAt = DateTime.now();
     final type = data['type']?.toString() ?? '';
 
     setState(() {
@@ -358,6 +525,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
           statusMessage = message;
           voiceState = voiceStateFromStatus(message);
           updateConnectionFlagsFromStatus(message);
+          realtimeRecovering = false;
         case 'provider_speaking':
           statusMessage =
               data['message']?.toString() ?? 'Provider is speaking...';
@@ -371,6 +539,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
                   ? 'Cloud backend connected. Realtime ready.'
                   : 'Cloud backend connected. Add OPENAI_API_KEY on Render.'
               : 'Cloud backend disconnected.';
+          if (backendConnected) realtimeRecovering = false;
         case 'provider_transcript':
           final text = data['text']?.toString().trim();
           if (text != null && text.isNotEmpty) {
@@ -387,6 +556,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
             );
             statusMessage = 'Provider heard. AI is preparing a response.';
             voiceState = VoiceState.thinking;
+            saveLiveSnapshot();
           }
         case 'goal_speech_status':
           statusMessage =
@@ -455,6 +625,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
           }
           statusMessage = 'AI is speaking to the provider.';
           voiceState = VoiceState.speaking;
+          realtimeRecovering = false;
         case 'ai_translation':
           final text = data['text']?.toString().trim();
           final translation = data['translation']?.toString().trim();
@@ -485,6 +656,7 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
             aiMessages[index] =
                 aiMessages[index].copyWith(title: 'AI speaking');
           }
+          saveLiveSnapshot();
         case 'approved':
           statusMessage = data['message']?.toString() ??
               'Approved. AI is confirming in $providerLanguage.';
@@ -496,6 +668,9 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
           voiceState = VoiceState.ready;
           backendConnected = false;
           realtimeReady = false;
+          realtimeRecovering = true;
+          weakNetworkMode = true;
+          trackEvent('realtime_error');
           aiMessages.add(
             ConversationLine(
               title: 'Connection issue',
@@ -536,6 +711,9 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
     }
     if (normalized.contains('waiting')) return VoiceState.ready;
     if (normalized.contains('listening')) return VoiceState.listening;
+    if (normalized.contains('thinking') || normalized.contains('preparing')) {
+      return VoiceState.thinking;
+    }
     if (normalized.contains('ai') || normalized.contains('confirm')) {
       return VoiceState.speaking;
     }
@@ -554,6 +732,8 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    realtimeWatchdog?.cancel();
     realtimeBridge.stop();
     destination.dispose();
     activity.dispose();
@@ -637,6 +817,8 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard> {
           microphonePermission: microphonePermission,
           realtimeReady: realtimeReady,
           backendBaseUrl: ApiConfig.backendBaseUrl,
+          recovering: realtimeRecovering,
+          weakNetworkMode: weakNetworkMode,
           providerMessages: providerMessages,
           aiMessages: aiMessages,
           onMic: startNegotiation,
@@ -1503,6 +1685,8 @@ class _LiveConversationSection extends StatefulWidget {
     required this.microphonePermission,
     required this.realtimeReady,
     required this.backendBaseUrl,
+    required this.recovering,
+    required this.weakNetworkMode,
     required this.providerMessages,
     required this.aiMessages,
     required this.onMic,
@@ -1519,6 +1703,8 @@ class _LiveConversationSection extends StatefulWidget {
   final bool microphonePermission;
   final bool realtimeReady;
   final String backendBaseUrl;
+  final bool recovering;
+  final bool weakNetworkMode;
   final List<ConversationLine> providerMessages;
   final List<ConversationLine> aiMessages;
   final VoidCallback onMic;
@@ -1673,6 +1859,10 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
                   realtimeReady: widget.realtimeReady,
                   backendBaseUrl: widget.backendBaseUrl,
                 ),
+                if (widget.recovering || widget.weakNetworkMode) ...[
+                  const SizedBox(height: 10),
+                  _RecoveryBanner(recovering: widget.recovering),
+                ],
                 const SizedBox(height: 16),
                 SizedBox(
                   height: 330,
@@ -1918,6 +2108,58 @@ class _TinyStatusChip extends StatelessWidget {
               color: color,
               fontSize: 11,
               fontWeight: FontWeight.w900,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RecoveryBanner extends StatelessWidget {
+  const _RecoveryBanner({required this.recovering});
+
+  final bool recovering;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 260),
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: colorScheme.tertiaryContainer.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: colorScheme.tertiary.withValues(alpha: 0.28),
+        ),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: recovering
+                ? CircularProgressIndicator(
+                    strokeWidth: 2.4,
+                    color: colorScheme.onTertiaryContainer,
+                  )
+                : Icon(Icons.network_check,
+                    size: 18, color: colorScheme.onTertiaryContainer),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              recovering
+                  ? 'Recovering connection and keeping this conversation ready...'
+                  : 'Weak mobile signal detected. Responses may arrive in smaller chunks.',
+              style: TextStyle(
+                color: colorScheme.onTertiaryContainer,
+                fontWeight: FontWeight.w800,
+                fontSize: 12,
+                height: 1.25,
+              ),
             ),
           ),
         ],
@@ -3399,6 +3641,14 @@ class ConversationLine {
   const ConversationLine(
       {required this.title, required this.text, required this.translation});
 
+  factory ConversationLine.fromJson(Map<String, dynamic> json) {
+    return ConversationLine(
+      title: json['title']?.toString() ?? '',
+      text: json['text']?.toString() ?? '',
+      translation: json['translation']?.toString() ?? '',
+    );
+  }
+
   final String title;
   final String text;
   final String translation;
@@ -3410,6 +3660,14 @@ class ConversationLine {
       text: text ?? this.text,
       translation: translation ?? this.translation,
     );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'title': title,
+      'text': text,
+      'translation': translation,
+    };
   }
 }
 
