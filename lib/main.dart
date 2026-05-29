@@ -910,6 +910,8 @@ class _NegotiatorDashboardState extends State<NegotiatorDashboard>
           backendBaseUrl: ApiConfig.backendBaseUrl,
           recovering: realtimeRecovering,
           weakNetworkMode: weakNetworkMode,
+          destination: destination.text,
+          activity: activity.text,
           providerMessages: providerMessages,
           aiMessages: aiMessages,
           onMic: handleLiveMic,
@@ -1782,6 +1784,8 @@ class _LiveConversationSection extends StatefulWidget {
     required this.backendBaseUrl,
     required this.recovering,
     required this.weakNetworkMode,
+    required this.destination,
+    required this.activity,
     required this.providerMessages,
     required this.aiMessages,
     required this.onMic,
@@ -1804,6 +1808,8 @@ class _LiveConversationSection extends StatefulWidget {
   final String backendBaseUrl;
   final bool recovering;
   final bool weakNetworkMode;
+  final String destination;
+  final String activity;
   final List<ConversationLine> providerMessages;
   final List<ConversationLine> aiMessages;
   final VoidCallback onMic;
@@ -1889,6 +1895,10 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
                                     : widget.state == VoiceState.listening
                                         ? 'Listening'
                                         : 'Waiting';
+    final liveContext = [
+      widget.activity.trim(),
+      widget.destination.trim(),
+    ].where((value) => value.isNotEmpty).join(' • ');
 
     return Container(
       clipBehavior: Clip.antiAlias,
@@ -1940,7 +1950,9 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        'Boat Tour • Bali',
+                        liveContext.isEmpty
+                            ? 'Realtime voice session'
+                            : liveContext,
                         style: TextStyle(
                           color: colorScheme.onSurfaceVariant,
                           fontSize: 14,
@@ -1961,8 +1973,6 @@ class _LiveConversationSectionState extends State<_LiveConversationSection> {
             padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
             child: Column(
               children: [
-                const _LiveBudgetCard(),
-                const SizedBox(height: 12),
                 _BackendStatusStrip(
                   connected: widget.backendConnected,
                   microphonePermission: widget.microphonePermission,
@@ -2180,7 +2190,7 @@ class _BackendStatusStrip extends StatelessWidget {
                 label: realtimeReady
                     ? 'Voice ready'
                     : connected
-                        ? 'AI text ready'
+                        ? 'Voice connecting'
                         : 'Connecting',
                 active: realtimeReady,
                 icon: Icons.graphic_eq_rounded,
@@ -2308,9 +2318,9 @@ class _BigLiveMicButton extends StatelessWidget {
         : muted
             ? 'Tap to unmute'
             : recording
-                ? 'Recording... tap to send'
+                ? 'Listening live'
                 : listening
-                    ? 'Tap to record provider'
+                    ? 'Listening live'
                     : 'Tap to start listening';
     final icon = !permissionGranted || muted
         ? Icons.mic_off
@@ -2429,103 +2439,6 @@ class _LiveDebugPanel extends StatelessWidget {
                 ),
               ),
             ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _LiveBudgetCard extends StatelessWidget {
-  const _LiveBudgetCard();
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
-    final isDark = theme.brightness == Brightness.dark;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: colorScheme.surface.withValues(alpha: isDark ? 0.68 : 0.92),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(
-          color: isDark ? AppColors.darkLine : AppColors.lightBorder,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: colorScheme.shadow.withValues(alpha: isDark ? 0.18 : 0.05),
-            blurRadius: 16,
-            offset: const Offset(0, 8),
-          )
-        ],
-      ),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Icon(Icons.circle, color: colorScheme.primary, size: 8),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Budget: \$100',
-                  style: TextStyle(
-                    color: colorScheme.onSurface,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-              ),
-              Icon(Icons.trending_down, color: colorScheme.secondary, size: 18),
-              const SizedBox(width: 5),
-              Text(
-                '\$160',
-                style: TextStyle(
-                  color: colorScheme.secondary,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(999),
-            child: Stack(
-              children: [
-                Container(
-                    height: 9,
-                    color: colorScheme.surfaceContainerHighest
-                        .withValues(alpha: 0.55)),
-                FractionallySizedBox(
-                  widthFactor: 0.62,
-                  child: Container(
-                    height: 9,
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [
-                          colorScheme.primary,
-                          colorScheme.secondary,
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 10),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              'AI saved you \$40 so far',
-              style: TextStyle(
-                color: colorScheme.onSurfaceVariant,
-                fontSize: 13,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
           ),
         ],
       ),

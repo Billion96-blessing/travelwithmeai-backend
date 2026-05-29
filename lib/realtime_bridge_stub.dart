@@ -23,6 +23,7 @@ class RealtimeBridge {
   bool _usingRealtime = false;
   bool _realtimeConnected = false;
   bool _realtimePlaybackActive = false;
+  bool _finishingRealtimePlayback = false;
   bool _fallbackRecordingTurn = false;
   int _sentChunkCount = 0;
   int _receivedAudioChunkCount = 0;
@@ -45,6 +46,7 @@ class RealtimeBridge {
     _usingRealtime = true;
     _realtimeConnected = false;
     _realtimePlaybackActive = false;
+    _finishingRealtimePlayback = false;
     _fallbackRecordingTurn = false;
     _sentChunkCount = 0;
     _receivedAudioChunkCount = 0;
@@ -62,6 +64,7 @@ class RealtimeBridge {
     _usingRealtime = false;
     _realtimeConnected = false;
     _realtimePlaybackActive = false;
+    _finishingRealtimePlayback = false;
     _fallbackRecordingTurn = false;
     _realtimeConnectTimeout?.cancel();
     _fallbackTurnRecordingTimer?.cancel();
@@ -189,10 +192,12 @@ class RealtimeBridge {
           'message': 'AI Speaking',
         });
       case 'realtime_playback_ended':
-        _emit(_lastCallback, 'audio_playback_ended', {
-          'message': 'Listening',
+        _emit(_lastCallback, 'voice_log', {
+          'message': 'native realtime playback ended',
         });
       case 'realtime_playback_error':
+        _realtimePlaybackActive = false;
+        _finishingRealtimePlayback = false;
         _emit(_lastCallback, 'error', {
           'message':
               data['message']?.toString() ?? 'Realtime audio playback failed.',
@@ -311,6 +316,22 @@ class RealtimeBridge {
           });
           _startNativeRealtimeCapture();
         }
+      case 'realtime_ready':
+        _realtimeConnected = true;
+        _realtimeConnectTimeout?.cancel();
+        _emit(onEvent, 'backend_status', {
+          'connected': true,
+          'microphonePermission': true,
+          'realtimeReady': true,
+          'backendBaseUrl': ApiConfig.backendBaseUrl,
+        });
+        _emit(onEvent, 'status', {
+          'message': data['message']?.toString() ?? 'Connected',
+        });
+        _emit(onEvent, 'voice_log', {
+          'message': 'realtime session ready',
+        });
+        if (data['listen'] == true) _startNativeRealtimeCapture();
       case 'provider_speaking':
         _emit(onEvent, 'provider_speaking', {
           'message': data['message'] ?? 'Provider speaking...',
@@ -331,6 +352,7 @@ class RealtimeBridge {
         if (audio.isEmpty) return;
         if (!_realtimePlaybackActive) {
           _realtimePlaybackActive = true;
+          _finishingRealtimePlayback = false;
           _receivedAudioChunkCount = 0;
           _channel
               .invokeMethod<bool>('stopRealtimeAudioCapture')
@@ -359,7 +381,16 @@ class RealtimeBridge {
           _emit(onEvent, 'ai_turn_done', {'text': _liveAiTranscript.trim()});
           _liveAiTranscript = '';
         }
-        _finishRealtimePlayback(onEvent);
+        if (type == 'response_done' && data['hadAudio'] == false) {
+          _emit(onEvent, 'voice_log', {
+            'message': 'realtime response completed without audio',
+          });
+        }
+        if (_realtimePlaybackActive) {
+          _finishRealtimePlayback(onEvent);
+        } else if (_active && _usingRealtime && _realtimeConnected) {
+          _returnToRealtimeListening(onEvent);
+        }
       case 'returned_listening':
         _emit(onEvent, 'status', {'message': 'Listening'});
       case 'error':
@@ -374,7 +405,8 @@ class RealtimeBridge {
         !_usingRealtime ||
         !_realtimeConnected ||
         _muted ||
-        _realtimePlaybackActive) {
+        _realtimePlaybackActive ||
+        _finishingRealtimePlayback) {
       return;
     }
     final audio = data['audioBase64']?.toString() ?? '';
@@ -390,25 +422,49 @@ class RealtimeBridge {
   }
 
   void _finishRealtimePlayback(RealtimeEventCallback onEvent) {
-    if (!_realtimePlaybackActive) return;
-    Timer(const Duration(milliseconds: 450), () {
-      _channel
-          .invokeMethod<bool>('stopRealtimeAudioPlayback')
-          .catchError((_) => false);
-      _realtimePlaybackActive = false;
-      _emit(onEvent, 'audio_playback_ended', {'message': 'Listening'});
-      _emit(onEvent, 'status', {'message': 'Listening'});
-      _emit(onEvent, 'voice_log', {
-        'message': 'returned to listening',
-      });
-      if (_active && _usingRealtime && !_muted) {
-        _startNativeRealtimeCapture();
-      }
+    if (!_realtimePlaybackActive || _finishingRealtimePlayback) return;
+    _finishingRealtimePlayback = true;
+    _emit(onEvent, 'voice_log', {
+      'message': 'waiting for realtime audio drain',
     });
+    () async {
+      try {
+        await _channel
+            .invokeMethod<bool>('finishRealtimeAudioPlayback')
+            .timeout(const Duration(seconds: 20));
+      } catch (error) {
+        _emit(onEvent, 'voice_log', {
+          'message': 'realtime audio drain failed: $error',
+        });
+        await _channel
+            .invokeMethod<bool>('stopRealtimeAudioPlayback')
+            .catchError((_) => false);
+      }
+      _realtimePlaybackActive = false;
+      _finishingRealtimePlayback = false;
+      _returnToRealtimeListening(onEvent);
+    }();
+  }
+
+  void _returnToRealtimeListening(RealtimeEventCallback onEvent) {
+    if (!_active || !_usingRealtime) return;
+    _emit(onEvent, 'audio_playback_ended', {'message': 'Listening'});
+    _emit(onEvent, 'status', {'message': 'Listening'});
+    _emit(onEvent, 'voice_log', {
+      'message': 'returned to listening',
+    });
+    if (!_muted) {
+      _startNativeRealtimeCapture();
+    }
   }
 
   Future<void> _startNativeRealtimeCapture() async {
-    if (!_active || _muted || _realtimePlaybackActive) return;
+    if (!_active ||
+        _muted ||
+        _realtimePlaybackActive ||
+        _finishingRealtimePlayback) {
+      return;
+    }
     try {
       await _channel
           .invokeMethod<bool>('startRealtimeAudioCapture')
@@ -427,6 +483,8 @@ class RealtimeBridge {
     if (!_active) return;
     _usingRealtime = false;
     _realtimeConnected = false;
+    _realtimePlaybackActive = false;
+    _finishingRealtimePlayback = false;
     _realtimeSocket?.sink.close();
     _realtimeSocket = null;
     _channel

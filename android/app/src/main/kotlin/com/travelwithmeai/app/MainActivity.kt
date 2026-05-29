@@ -48,9 +48,12 @@ class MainActivity : FlutterActivity() {
     private var realtimePlaybackStarted = false
     private var realtimeAudioChunkCount = 0
     private var realtimePlaybackChunkCount = 0
+    private var realtimePlaybackFramesWritten: Long = 0
 
     companion object {
         private const val REALTIME_SAMPLE_RATE = 24000
+        private const val REALTIME_BYTES_PER_FRAME = 2
+        private const val REALTIME_CAPTURE_CHUNK_MS = 100
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -68,6 +71,7 @@ class MainActivity : FlutterActivity() {
                     val audioBase64 = call.argument<String>("audioBase64") ?: ""
                     playRealtimeAudioChunk(audioBase64, result)
                 }
+                "finishRealtimeAudioPlayback" -> finishRealtimeAudioPlayback(result)
                 "stopRealtimeAudioPlayback" -> stopRealtimeAudioPlayback(result)
                 "playAudioBase64" -> {
                     val audioBase64 = call.argument<String>("audioBase64") ?: ""
@@ -131,7 +135,9 @@ class MainActivity : FlutterActivity() {
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = maxOf(minBuffer, REALTIME_SAMPLE_RATE / 5 * 2)
+            val targetChunkBytes =
+                REALTIME_SAMPLE_RATE * REALTIME_BYTES_PER_FRAME * REALTIME_CAPTURE_CHUNK_MS / 1000
+            val bufferSize = maxOf(minBuffer, targetChunkBytes)
             val nextRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 AudioRecord.Builder()
                     .setAudioSource(AudioSource.VOICE_RECOGNITION)
@@ -206,6 +212,12 @@ class MainActivity : FlutterActivity() {
             realtimeRecorder?.stop()
         } catch (_: Exception) {
         }
+        if (Thread.currentThread() != realtimeCaptureThread) {
+            try {
+                realtimeCaptureThread?.join(250)
+            } catch (_: Exception) {
+            }
+        }
         realtimeRecorder?.release()
         realtimeRecorder = null
         realtimeCaptureThread = null
@@ -233,7 +245,7 @@ class MainActivity : FlutterActivity() {
                 if (realtimePlaybackChunkCount == 1 || realtimePlaybackChunkCount % 50 == 0) {
                     voiceLog("realtime_ai_audio_chunk_played count=$realtimePlaybackChunkCount bytes=${audioBytes.size}")
                 }
-                track.write(audioBytes, 0, audioBytes.size)
+                writeRealtimeAudio(track, audioBytes)
             } catch (error: Exception) {
                 voiceLog("realtime_playback_failed:${error.message}")
                 emitNativeVoiceEvent(
@@ -243,6 +255,28 @@ class MainActivity : FlutterActivity() {
             }
         }
         result.success(true)
+    }
+
+    private fun finishRealtimeAudioPlayback(result: MethodChannel.Result) {
+        audioExecutor.execute {
+            try {
+                drainRealtimeAudioTrack()
+                stopRealtimeAudioTrack()
+                voiceLog("realtime_playback_ended chunks=$realtimePlaybackChunkCount")
+                emitNativeVoiceEvent("realtime_playback_ended", mapOf("chunks" to realtimePlaybackChunkCount))
+                mainHandler.post { result.success(true) }
+            } catch (error: Exception) {
+                voiceLog("realtime_playback_finish_failed:${error.message}")
+                stopRealtimeAudioTrack()
+                emitNativeVoiceEvent(
+                    "realtime_playback_error",
+                    mapOf("message" to (error.message ?: "Realtime playback finish failed."))
+                )
+                mainHandler.post {
+                    result.error("REALTIME_PLAYBACK_FINISH_FAILED", error.message, null)
+                }
+            }
+        }
     }
 
     private fun stopRealtimeAudioPlayback(result: MethodChannel.Result) {
@@ -299,6 +333,38 @@ class MainActivity : FlutterActivity() {
         return track
     }
 
+    private fun writeRealtimeAudio(track: AudioTrack, audioBytes: ByteArray) {
+        var offset = 0
+        while (offset < audioBytes.size) {
+            val written = track.write(audioBytes, offset, audioBytes.size - offset)
+            if (written > 0) {
+                offset += written
+                realtimePlaybackFramesWritten += written / REALTIME_BYTES_PER_FRAME
+            } else if (written == 0) {
+                Thread.sleep(5)
+            } else {
+                throw IllegalStateException("AudioTrack write failed: $written")
+            }
+        }
+    }
+
+    private fun drainRealtimeAudioTrack() {
+        val track = realtimeAudioTrack ?: return
+        val targetFrames = realtimePlaybackFramesWritten
+        if (targetFrames <= 0L) return
+
+        val playedAtStart = track.playbackHeadPosition.toLong() and 0xffffffffL
+        val remainingFrames = (targetFrames - playedAtStart).coerceAtLeast(0L)
+        val maxWaitMs =
+            ((remainingFrames * 1000L) / REALTIME_SAMPLE_RATE + 1200L).coerceAtLeast(1200L)
+        val startedAt = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startedAt < maxWaitMs) {
+            val playedFrames = track.playbackHeadPosition.toLong() and 0xffffffffL
+            if (playedFrames >= targetFrames) break
+            Thread.sleep(20)
+        }
+    }
+
     private fun stopRealtimeAudioTrack() {
         try {
             realtimeAudioTrack?.pause()
@@ -309,6 +375,7 @@ class MainActivity : FlutterActivity() {
         realtimeAudioTrack?.release()
         realtimeAudioTrack = null
         realtimePlaybackStarted = false
+        realtimePlaybackFramesWritten = 0
     }
 
     private fun startVoiceRecording(result: MethodChannel.Result) {
